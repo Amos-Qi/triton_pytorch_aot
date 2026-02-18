@@ -1,4 +1,4 @@
-// Copyright 2020-2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2020-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -32,12 +32,10 @@
 // Suppress warnings in torch headers
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wdangling-reference"
 #pragma warning(push, 0)
-#include <torch/csrc/jit/codegen/cuda/interface.h>
-#include <torch/csrc/jit/codegen/fuser/interface.h>
-#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
-#include <torch/csrc/jit/runtime/graph_executor.h>
-#include <torch/script.h>  // One-stop header for TorchScript
+#include <torch/torch.h>
+#include <torch/csrc/inductor/aoti_package/model_package_loader.h>
 #pragma warning(pop)
 #pragma GCC diagnostic pop
 

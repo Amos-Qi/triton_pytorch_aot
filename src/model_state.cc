@@ -37,12 +37,10 @@ std::once_flag pytorch_intraop_threads_flag;
 namespace triton::backend::pytorch {
 
 ModelState::ModelState(TRITONBACKEND_Model* triton_model)
-    : BackendModel(triton_model), enable_optimized_execution_(true),
-      enable_inference_mode_(true), enable_cudnn_(true),
-      enable_cache_cleaning_(false), enable_weight_sharing_(false),
-      enable_tensor_fuser_pair_({false, true}),
-      enable_jit_profiling_pair_({false, true}),
-      enable_jit_executor_pair_({false, true})
+    : BackendModel(triton_model), enable_inference_mode_(true),
+      enable_cudnn_(true), enable_cache_cleaning_(false),
+      enable_weight_sharing_(false), disable_pinned_input_(false),
+      total_instance_count_(1)
 {
 }
 
@@ -125,6 +123,28 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
     }
   }
 
+  // Parse instance_group to get total instance count for weight sharing
+  triton::common::TritonJson::Value instance_groups;
+  if ((*state)->ModelConfig().Find("instance_group", &instance_groups)) {
+    size_t total_count = 0;
+    for (size_t i = 0; i < instance_groups.ArraySize(); i++) {
+      triton::common::TritonJson::Value group;
+      RETURN_IF_ERROR(instance_groups.IndexAsObject(i, &group));
+      int64_t count = 1;
+      group.MemberAsInt("count", &count);
+      total_count += static_cast<size_t>(count);
+    }
+    if (total_count > 0) {
+      (*state)->total_instance_count_ = total_count;
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Total instance count: ") +
+           std::to_string(total_count) + " for model '" + (*state)->Name() +
+           "'")
+              .c_str());
+    }
+  }
+
   RETURN_IF_ERROR((*state)->ParseParameters());
 
   return nullptr;  // success
@@ -148,48 +168,41 @@ ModelState::EnabledInferenceMode()
   return enable_inference_mode_;
 }
 
-const std::pair<bool, bool>&
-ModelState::EnabledJitExecutor() const
-{
-  return enable_jit_executor_pair_;
-}
-
-const std::pair<bool, bool>&
-ModelState::EnabledJitProfiling() const
-{
-  return enable_jit_profiling_pair_;
-}
-
-bool
-ModelState::EnabledOptimizedExecution()
-{
-  return enable_optimized_execution_;
-}
-
-const std::pair<bool, bool>&
-ModelState::EnabledTensorExprFuser() const
-{
-  return enable_tensor_fuser_pair_;
-}
-
 bool
 ModelState::EnabledWeightSharing()
 {
   return enable_weight_sharing_;
 }
 
+bool
+ModelState::IsPinnedInputDisabled() const
+{
+  return disable_pinned_input_;
+}
+
+bool
+ModelState::EnablePinnedInput() const
+{
+  // If disable_pinned_input_ is true, return false to disable pinned input
+  // Otherwise, use the default behavior from BackendModel
+  if (disable_pinned_input_) {
+    return false;
+  }
+  return BackendModel::EnablePinnedInput();
+}
+
 TRITONSERVER_Error*
 ModelState::LoadModel(
     const std::string& artifact_name, const torch::Device device,
     std::string* model_path, const TRITONSERVER_InstanceGroupKind& kind,
-    std::shared_ptr<torch::jit::script::Module>* torch_model)
+    std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model)
 {
-  // Find the TorchScript file that describes the model. If the model
+  // Find the AOTInductor package file that describes the model. If the model
   // configuration doesn't have an explicit model file specified then
-  // use the default name ("model.pt").
+  // use the default name ("model.pt2").
   std::string cc_model_filename = artifact_name;
   if (cc_model_filename.empty()) {
-    cc_model_filename = "model.pt";
+    cc_model_filename = "model.pt2";
   }
 
   *model_path = JoinPath(
@@ -209,45 +222,54 @@ ModelState::LoadModel(
   std::pair<bool, int> device_pair;
   if (enable_weight_sharing_) {
     device_pair = std::make_pair(!device.is_cpu(), device.index());
-    auto mit = torch_models_.find(device_pair);
-    if (mit != torch_models_.end()) {
-      *torch_model = mit->second;
+    auto mit = aoti_models_.find(device_pair);
+    if (mit != aoti_models_.end()) {
+      *aoti_model = mit->second;
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
-          (std::string("Reusing TorchScript model for instance '") + Name() +
+          (std::string("Reusing AOTInductor model for instance '") + Name() +
            "'")
               .c_str());
       return nullptr;  // success
     }
   }
 
-  // Serialize the torch model to string
-  std::string model_data_str;
-  RETURN_IF_ERROR(ReadTextFile(*model_path, &model_data_str));
-
   // InferenceMode should be used to guard all tensors operations including
   // model loading: https://pytorch.org/cppdocs/notes/inference_mode.html
   torch::InferenceMode infer_guard(EnabledInferenceMode());
 
   try {
-    std::istringstream model_stream(model_data_str);
-    if (kind == TRITONSERVER_INSTANCEGROUPKIND_MODEL) {
-      // Load the model without selecting a device.
-      torch_model->reset(
-          new torch::jit::Module(torch::jit::load(model_stream)));
-    } else {
-      torch_model->reset(
-          new torch::jit::Module(torch::jit::load(model_stream, device)));
+    // Determine the device index for AOTInductor
+    int device_index = -1;  // Default for CPU or auto-selection
+    if (!device.is_cpu()) {
+      device_index = device.index();
     }
+
+    // When weight sharing is enabled, use num_runners equal to the instance
+    // count to allow concurrent inference from all instances sharing the model.
+    size_t num_runners = enable_weight_sharing_ ? total_instance_count_ : 1;
+
+    // Load the AOTInductor package
+    aoti_model->reset(new torch::inductor::AOTIModelPackageLoader(
+        *model_path, "model" /* model_name */, false /* run_single_threaded */,
+        num_runners, device_index));
+
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_INFO,
+        (std::string("Loaded AOTInductor model from '") + *model_path +
+         "' with " + std::to_string(num_runners) + " runner(s)" +
+         " for instance '" + Name() + "'")
+            .c_str());
   }
   catch (const std::exception& ex) {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_INTERNAL,
-        ("failed to load model '" + Name() + "': " + ex.what()).c_str());
+        ("failed to load AOTInductor model '" + Name() + "': " + ex.what())
+            .c_str());
   }
 
   if (enable_weight_sharing_) {
-    if (!((torch_models_.emplace(device_pair, *torch_model)).second)) {
+    if (!((aoti_models_.emplace(device_pair, *aoti_model)).second)) {
       std::string type = device.is_cpu() ? "CPU" : "GPU";
       LOG_MESSAGE(
           TRITONSERVER_LOG_WARN,
@@ -272,30 +294,9 @@ ModelState::ParseParameters()
   triton::common::TritonJson::Value params;
   bool status = model_config_.Find("parameters", &params);
   if (status) {
-    // If 'DISABLE_OPTIMIZED_EXECUTION' is not present in 'parameters' then no
-    // update is made to 'enable_optimized_execution_'.
-    bool disable_optimized_execution = false;
-    TRITONSERVER_Error* err = ParseParameter(
-        params, "DISABLE_OPTIMIZED_EXECUTION", &disable_optimized_execution);
-    if (err != nullptr) {
-      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
-        return err;
-      } else {
-        TRITONSERVER_ErrorDelete(err);
-      }
-    }
-    enable_optimized_execution_ = !disable_optimized_execution;
-
-    LOG_MESSAGE(
-        TRITONSERVER_LOG_INFO,
-        (std::string("Optimized execution is ") +
-         (enable_optimized_execution_ ? "enabled" : "disabled") +
-         " for model instance '" + Name() + "'")
-            .c_str());
-
     // If 'ENABLE_CACHE_CLEANING' is not present in 'parameters' then
     // no update is made to 'enable_cache_cleaning_'.
-    err = ParseParameter(
+    TRITONSERVER_Error* err = ParseParameter(
         params, "ENABLE_CACHE_CLEANING", &enable_cache_cleaning_);
     if (err != nullptr) {
       if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
@@ -347,26 +348,6 @@ ModelState::ParseParameters()
          " for model instance '" + Name() + "'")
             .c_str());
 
-    // If 'ENABLE_TENSOR_FUSER' is not present in 'parameters' then no
-    // update is made to 'enable_tensor_fuser'.
-    bool enable_tensor_fuser = false;
-    err = ParseParameter(params, "ENABLE_TENSOR_FUSER", &enable_tensor_fuser);
-    if (err != nullptr) {
-      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
-        return err;
-      } else {
-        TRITONSERVER_ErrorDelete(err);
-      }
-    } else {
-      enable_tensor_fuser_pair_ = {true, enable_tensor_fuser};
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_INFO,
-          (std::string("Tensor fuser is ") +
-           (enable_tensor_fuser ? "enabled" : "disabled") +
-           " for model instance '" + Name() + "'")
-              .c_str());
-    }
-
     // If 'ENABLE_WEIGHT_SHARING' is not present in 'parameters' then no
     // update is made to 'enable_weight_sharing'.
     err = ParseParameter(
@@ -386,10 +367,10 @@ ModelState::ParseParameters()
               .c_str());
     }
 
-    // If 'ENABLE_JIT_PROFILING' is not present in 'parameters' then no update
-    // is made to 'enable_jit_profiling'.
-    bool enable_jit_profiling = false;
-    err = ParseParameter(params, "ENABLE_JIT_PROFILING", &enable_jit_profiling);
+    // If 'DISABLE_PINNED_INPUT' is not present in 'parameters' then no
+    // update is made to 'disable_pinned_input_'.
+    bool disable_pinned_input = false;
+    err = ParseParameter(params, "DISABLE_PINNED_INPUT", &disable_pinned_input);
     if (err != nullptr) {
       if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
         return err;
@@ -397,31 +378,11 @@ ModelState::ParseParameters()
         TRITONSERVER_ErrorDelete(err);
       }
     } else {
-      enable_jit_profiling_pair_ = {true, enable_jit_profiling};
+      disable_pinned_input_ = disable_pinned_input;
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
-          (std::string("Jit profiling is ") +
-           (enable_jit_profiling ? "enabled" : "disabled") +
-           " for model instance '" + Name() + "'")
-              .c_str());
-    }
-
-    // If 'ENABLE_JIT_EXECUTOR' is not present in 'parameters' then no update is
-    // made to 'enable_jit_executor'.
-    bool enable_jit_executor = false;
-    err = ParseParameter(params, "ENABLE_JIT_EXECUTOR", &enable_jit_executor);
-    if (err != nullptr) {
-      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
-        return err;
-      } else {
-        TRITONSERVER_ErrorDelete(err);
-      }
-    } else {
-      enable_jit_executor_pair_ = {true, enable_jit_executor};
-      LOG_MESSAGE(
-          TRITONSERVER_LOG_INFO,
-          (std::string("Jit executor is ") +
-           (enable_jit_executor ? "enabled" : "disabled") +
+          (std::string("Pinned input is ") +
+           (disable_pinned_input_ ? "disabled" : "enabled") +
            " for model instance '" + Name() + "'")
               .c_str());
     }

@@ -53,10 +53,7 @@ namespace triton::backend::pytorch {
 
 class ModelState : public triton::backend::BackendModel {
  private:
-  // Flag to indicate whether optimized execution is enabled. Defaults to true.
-  bool enable_optimized_execution_;
-
-  // Flag to indicate whether inference mode is enabled. Defaults to false.
+  // Flag to indicate whether inference mode is enabled. Defaults to true.
   bool enable_inference_mode_;
 
   // Flag to indicate whether cudnn is enabled. Defaults to true.
@@ -69,18 +66,19 @@ class ModelState : public triton::backend::BackendModel {
   // Flag to indicate whether weight sharing is enabled. Defaults to false.
   bool enable_weight_sharing_;
 
-  // Flag pairs to indicate if various JIT settings are set and
-  // enabled respectively. Defaults to (false, true). Default behavior
-  // is to do nothing if not explicitly set.
-  std::pair<bool, bool> enable_tensor_fuser_pair_;
-  std::pair<bool, bool> enable_jit_profiling_pair_;
-  std::pair<bool, bool> enable_jit_executor_pair_;
+  // Flag to disable pinned input memory. Defaults to false (pinned input enabled by default).
+  bool disable_pinned_input_;
 
-  // Model mapping for shared TorchScript model across all instances on the
+  // Total instance count from instance_group configuration.
+  // Used to determine num_runners when weight sharing is enabled.
+  size_t total_instance_count_;
+
+  // Model mapping for shared AOTInductor model across all instances on the
   // same device. The key is a pair of isGPU and device index.
   std::map<
-      std::pair<bool, int64_t>, std::shared_ptr<torch::jit::script::Module>>
-      torch_models_;
+      std::pair<bool, int64_t>,
+      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>>
+      aoti_models_;
 
   // model_outputs is a map that contains unique outputs that the model must
   // provide. The first pair is the model output index and the second is
@@ -103,20 +101,19 @@ class ModelState : public triton::backend::BackendModel {
 
   bool EnabledInferenceMode();
 
-  const std::pair<bool, bool>& EnabledJitExecutor() const;
-
-  const std::pair<bool, bool>& EnabledJitProfiling() const;
-
-  bool EnabledOptimizedExecution();
-
-  const std::pair<bool, bool>& EnabledTensorExprFuser() const;
-
   bool EnabledWeightSharing();
+
+  // Check if pinned input is disabled
+  bool IsPinnedInputDisabled() const;
+
+  // Custom EnablePinnedInput implementation to respect disable_pinned_input_ flag
+  // Note: This is not an override since BackendModel::EnablePinnedInput() is not virtual
+  bool EnablePinnedInput() const;
 
   TRITONSERVER_Error* LoadModel(
       const std::string& artifact_name, const torch::Device device,
       std::string* model_path, const TRITONSERVER_InstanceGroupKind& kind,
-      std::shared_ptr<torch::jit::script::Module>* torch_model);
+      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model);
 
   const std::map<std::string, std::pair<int64_t, int64_t>>& ModelOutputs();
 

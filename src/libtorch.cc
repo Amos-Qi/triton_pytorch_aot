@@ -27,7 +27,7 @@
 #include "libtorch.hh"
 
 //
-// PyTorch C++ (LibTorch) Backend that implements the TRITONBACKEND API.
+// PyTorch AOTInductor Backend that implements the TRITONBACKEND API.
 //
 
 namespace triton::backend::pytorch {

@@ -26,7 +26,7 @@
 
 cmake_minimum_required (VERSION 3.31.8)
 
-project(tritonpytorchbackend LANGUAGES C CXX)
+project(tritonpytorchaotbackend LANGUAGES C CXX)
 
 # Use C++17 standard as Triton's minimum required.
 set(TRITON_MIN_CXX_STANDARD 17 CACHE STRING "The minimum C++ standard which features are requested to build this target.")
@@ -171,7 +171,7 @@ endif() # TRITON_ENABLE_NVTX
 #
 # Shared library implementing the Triton Backend API
 #
-configure_file(src/libtriton_pytorch.ldscript libtriton_pytorch.ldscript COPYONLY)
+configure_file(src/libtriton_pytorch_aot.ldscript libtriton_pytorch_aot.ldscript COPYONLY)
 
 set(PT_LIBS
     "libc10.so"
@@ -183,10 +183,7 @@ set(PT_LIBS
     "libtorch_global_deps.so"
     "libjpeg.so.62"
     "libshm.so"
-    "libbackend_with_compiler.so"
-    "libaoti_custom_ops.so"
     "libtorch_python.so"
-    "libcaffe2_nvrtc.so"
 )
 
 if (${TRITON_PYTORCH_NVSHMEM})
@@ -288,7 +285,7 @@ if (${TRITON_PYTORCH_DOCKER_BUILD})
     COMMAND /bin/sh -c "if [ ${TRITON_PYTORCH_ENABLE_TORCHTRT} = 'ON' ]; then docker cp pytorch_backend_ptlib:${PY_INSTALL_PATH}/torch_tensorrt/bin/torchtrtc torchtrtc; fi"
     COMMAND docker cp pytorch_backend_ptlib:/opt/pytorch/pytorch/LICENSE LICENSE.pytorch
     COMMAND docker cp pytorch_backend_ptlib:${PY_INSTALL_PATH}/torch/include include/torch
-    COMMAND docker cp pytorch_backend_ptlib:/opt/pytorch/pytorch/torch/csrc/jit/codegen include/torch/torch/csrc/jit/.
+    COMMAND docker cp pytorch_backend_ptlib:/opt/pytorch/pytorch/torch/csrc/inductor include/torch/torch/csrc/.
 
     COMMAND /bin/sh -c "if [ ${RHEL_BUILD} = 'ON' ]; then docker cp -L pytorch_backend_ptlib:/usr/lib64/libjpeg.so.62 libjpeg.so.62; else docker cp -L pytorch_backend_ptlib:/usr/local/lib/libjpeg.so.62 libjpeg.so.62 && docker cp pytorch_backend_ptlib:/usr/lib/${LIBS_ARCH}-linux-gnu/libjpeg.so.8.2.2 libjpeg.so; fi;"
     COMMAND /bin/sh -c "if [ ${RHEL_BUILD} = 'ON' ]; then docker cp -L pytorch_backend_ptlib:/usr/lib64/libpng16.so.16 libpng16.so.16; else docker cp -L pytorch_backend_ptlib:/usr/lib/${LIBS_ARCH}-linux-gnu/libpng16.so libpng16.so; fi;"
@@ -330,7 +327,7 @@ add_library(
 )
 
 add_library(
-  TritonPyTorchBackend::triton-pytorch-backend ALIAS triton-pytorch-backend
+  TritonPyTorchAotBackend::triton-pytorch-backend ALIAS triton-pytorch-backend
 )
 
 target_include_directories(
@@ -376,13 +373,13 @@ set_target_properties(
   triton-pytorch-backend
   PROPERTIES
     POSITION_INDEPENDENT_CODE ON
-    OUTPUT_NAME triton_pytorch
+    OUTPUT_NAME triton_pytorch_aot
     SKIP_BUILD_RPATH TRUE
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH_USE_LINK_PATH FALSE
     INSTALL_RPATH "$\{ORIGIN\}"
-    LINK_DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libtriton_pytorch.ldscript
-    LINK_FLAGS "-Wl,--no-as-needed,--version-script libtriton_pytorch.ldscript"
+    LINK_DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/libtriton_pytorch_aot.ldscript
+    LINK_FLAGS "-Wl,--no-as-needed,--version-script libtriton_pytorch_aot.ldscript"
 )
 
 # Need to turn off unused-but-set-variable due to Torchvision
@@ -466,7 +463,7 @@ endif() # TRITON_ENABLE_GPU
 # Install
 #
 include(GNUInstallDirs)
-set(INSTALL_CONFIGDIR ${CMAKE_INSTALL_LIBDIR}/cmake/TritonPyTorchBackend)
+set(INSTALL_CONFIGDIR ${CMAKE_INSTALL_LIBDIR}/cmake/TritonPyTorchAotBackend)
 message(TRACE "INSTALL_CONFIGDIR: ${INSTALL_CONFIGDIR}")
 
 install(
@@ -474,8 +471,8 @@ install(
     triton-pytorch-backend
   EXPORT
     triton-pytorch-backend-targets
-  LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch
-  ARCHIVE DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch
+  LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
 )
 
 if (${TRITON_PYTORCH_DOCKER_BUILD})
@@ -490,14 +487,14 @@ if (${TRITON_PYTORCH_DOCKER_BUILD})
     FILES
       ${PT_LIB_PATHS}
       ${CMAKE_CURRENT_BINARY_DIR}/LICENSE.pytorch
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
   )
 
   if (${TRITON_PYTORCH_ENABLE_TORCHTRT})
     install(
       FILES
         ${CMAKE_CURRENT_BINARY_DIR}/torchtrtc
-      DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch
+      DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
     )
   endif() # TRITON_PYTORCH_ENABLE_TORCHTRT
 
@@ -507,7 +504,7 @@ if (${TRITON_PYTORCH_DOCKER_BUILD})
         "EXECUTE_PROCESS(
           COMMAND patchelf --set-rpath \$ORIGIN ${plib}
           RESULT_VARIABLE PATCHELF_STATUS
-          WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch)
+          WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot)
         if(PATCHELF_STATUS AND NOT PATCHELF_STATUS EQUAL 0)
           message(FATAL_ERROR \"FAILED: to run patchelf\")
         endif()"
@@ -520,45 +517,63 @@ if (${TRITON_PYTORCH_DOCKER_BUILD})
         COMMAND ln -sf libpng16.so libpng16.so.16
         COMMAND ln -sf libjpeg.so libjpeg.so.8
         RESULT_VARIABLE LINK_STATUS
-        WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch)
+        WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot)
       if(LINK_STATUS AND NOT LINK_STATUS EQUAL 0)
         message(FATAL_ERROR \"FAILED: to create links\")
       endif()"
   )
 else()
+  # Filter out system libraries that are only available in Docker builds
+  set(SYSTEM_LIBS "libjpeg.so.62" "libjpeg.so" "libpng16.so.16" "libpng16.so")
+  set(PT_LIBS_FILTERED "")
   FOREACH(plib ${PT_LIBS})
-    set(PT_LIB_PATHS ${PT_LIB_PATHS} "${TRITON_PYTORCH_LIB_PATHS}/${plib}")
+    list(FIND SYSTEM_LIBS ${plib} IS_SYSTEM_LIB)
+    if(IS_SYSTEM_LIB EQUAL -1)
+      list(APPEND PT_LIBS_FILTERED ${plib})
+    endif()
+  ENDFOREACH(plib)
+
+  FOREACH(plib ${PT_LIBS_FILTERED})
+    set(PLIB_PATH "${TRITON_PYTORCH_LIB_PATHS}/${plib}")
+    if(EXISTS ${PLIB_PATH})
+      list(APPEND PT_LIB_PATHS ${PLIB_PATH})
+    else()
+      message(WARNING "PyTorch library ${plib} not found at ${PLIB_PATH}, skipping installation")
+    endif()
   ENDFOREACH(plib)
 
   message(TRACE "PT_LIB_PATHS: ${PT_LIB_PATHS}")
 
-  install(
-    FILES
-      ${PT_LIB_PATHS}
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch
-  )
-
-  FOREACH(plib ${PT_LIBS})
+  if(PT_LIB_PATHS)
     install(
-      CODE
-        "EXECUTE_PROCESS(
-          COMMAND patchelf --set-rpath \$ORIGIN ${plib}
-          RESULT_VARIABLE PATCHELF_STATUS
-          WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch)
-        if(PATCHELF_STATUS AND NOT PATCHELF_STATUS EQUAL 0)
-          message(FATAL_ERROR \"FAILED: to run patchelf\")
-        endif()"
+      FILES
+        ${PT_LIB_PATHS}
+      DESTINATION ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
     )
-  ENDFOREACH(plib)
+
+    FOREACH(plib_path ${PT_LIB_PATHS})
+      get_filename_component(plib ${plib_path} NAME)
+      install(
+        CODE
+          "EXECUTE_PROCESS(
+            COMMAND patchelf --set-rpath \$ORIGIN ${plib}
+            RESULT_VARIABLE PATCHELF_STATUS
+            WORKING_DIRECTORY ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot)
+          if(PATCHELF_STATUS AND NOT PATCHELF_STATUS EQUAL 0)
+            message(WARNING \"Failed to run patchelf on ${plib}, continuing...\")
+          endif()"
+      )
+    ENDFOREACH(plib_path)
+  endif()
 endif() # TRITON_PYTORCH_DOCKER_BUILD
 
 install(
   EXPORT
     triton-pytorch-backend-targets
   FILE
-    TritonPyTorchBackendTargets.cmake
+    TritonPyTorchAotBackendTargets.cmake
   NAMESPACE
-    TritonPyTorchBackend::
+    TritonPyTorchAotBackend::
   DESTINATION
     ${INSTALL_CONFIGDIR}
 )
@@ -567,19 +582,19 @@ install(
   FILES
     src/model.py
   DESTINATION
-    ${CMAKE_INSTALL_PREFIX}/backends/pytorch
+    ${CMAKE_INSTALL_PREFIX}/backends/pytorch_aot
 )
 
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
-  ${CMAKE_CURRENT_LIST_DIR}/cmake/TritonPyTorchBackendConfig.cmake.in
-  ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchBackendConfig.cmake
+  ${CMAKE_CURRENT_LIST_DIR}/cmake/TritonPyTorchAotBackendConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchAotBackendConfig.cmake
   INSTALL_DESTINATION ${INSTALL_CONFIGDIR}
 )
 
 install(
   FILES
-  ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchBackendConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchAotBackendConfig.cmake
   DESTINATION ${INSTALL_CONFIGDIR}
 )
 
@@ -588,8 +603,8 @@ install(
 #
 export(
   EXPORT triton-pytorch-backend-targets
-  FILE ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchBackendTargets.cmake
-  NAMESPACE TritonPyTorchBackend::
+  FILE ${CMAKE_CURRENT_BINARY_DIR}/TritonPyTorchAotBackendTargets.cmake
+  NAMESPACE TritonPyTorchAotBackend::
 )
 
-export(PACKAGE TritonPyTorchBackend)
+export(PACKAGE TritonPyTorchAotBackend)

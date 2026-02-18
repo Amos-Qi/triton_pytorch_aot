@@ -67,7 +67,8 @@
 
 namespace triton::backend::pytorch {
 
-void FillStringTensor(torch::List<std::string>* input_list, const size_t cnt);
+// Note: AOTInductor models do not support string/bytes input or output types.
+// The string-related functions have been removed as they are not applicable.
 
 // This function will return a tensor's contents as a contiguous
 // chunk in system memory. In some cases this will require copying the data.
@@ -80,27 +81,5 @@ TRITONSERVER_Error* GetContiguousInputContent(
     TRITONBACKEND_Input* rinput, const uint32_t buffer_count,
     const char** content, size_t* content_byte_size,
     std::vector<char>* contiguous_buffer, cudaStream_t stream, bool* cuda_copy);
-
-bool SetStringBuffer(
-    torch::List<torch::jit::IValue>* tensor, TRITONBACKEND_Response** response,
-    TRITONBACKEND_Output* response_output, TRITONBACKEND_State* response_state,
-    const size_t tensor_element_count, cudaStream_t stream,
-    std::string* serialized, bool state);
-
-bool SetStringInputTensor(
-    torch::List<std::string>* input_list, TRITONBACKEND_Input* input,
-    const char* name, const uint32_t buffer_count,
-    const size_t request_element_cnt, TRITONBACKEND_Response** response,
-    cudaStream_t stream, const char* host_policy_name);
-
-bool SetStringOutputBuffer(
-    torch::List<torch::jit::IValue>* tensor, TRITONBACKEND_Response** response,
-    TRITONBACKEND_Output* response_output, const size_t tensor_element_count,
-    cudaStream_t stream, std::string* serialized);
-
-bool SetStringStateBuffer(
-    torch::List<torch::jit::IValue>* tensor, TRITONBACKEND_Response** response,
-    TRITONBACKEND_State* response_state, const size_t tensor_element_count,
-    cudaStream_t stream, std::string* serialized);
 
 }  // namespace triton::backend::pytorch

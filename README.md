@@ -33,9 +33,9 @@
 The Triton backend for
 [PyTorch](https://github.com/pytorch/pytorch)
 is designed to run
-[TorchScript](https://pytorch.org/docs/stable/jit.html)
-models using the PyTorch C++ API.
-All models created in PyTorch using the python API must be traced/scripted to produce a TorchScript model.
+[AOTInductor](https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/torch.compiler_aot_inductor.html)
+compiled models using the PyTorch C++ API.
+Models must be exported using `torch.export.export()` and compiled using `torch._inductor.aoti_compile_and_package()` to produce a `.pt2` package file.
 
 You can learn more about Triton backends in the
 [Triton Backend](https://github.com/triton-inference-server/backend)
@@ -101,13 +101,52 @@ make install
 
 ## Using the PyTorch Backend
 
-### PyTorch 2.0 Models
+### AOTInductor Models
 
-PyTorch 2.0 features are available.
-However, Triton's PyTorch backend requires a serialized representation of the model in the form a `model.pt` file.
-The serialized representation of the model can be generated using PyTorch's
-[`torch.save()`](https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html#id1)
-function to generate the `model.pt` file.
+This backend supports AOTInductor compiled models packaged as `.pt2` files. To create a model:
+
+1. Export your model using `torch.export.export()`
+2. Compile it using `torch._inductor.aoti_compile_and_package()`
+
+Example Python code to generate the model:
+
+```python
+import torch
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(10, 16)
+        self.relu = torch.nn.ReLU()
+        self.fc2 = torch.nn.Linear(16, 1)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.sigmoid(x)
+        return x
+
+with torch.no_grad():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Model().to(device=device)
+    example_inputs = (torch.randn(8, 10, device=device),)
+
+    # Optional: Specify dynamic dimensions
+    batch_dim = torch.export.Dim("batch", min=1, max=1024)
+
+    # Export the model
+    exported = torch.export.export(
+        model, example_inputs, dynamic_shapes={"x": {0: batch_dim}}
+    )
+
+    # Compile and package
+    torch._inductor.aoti_compile_and_package(
+        exported,
+        package_path="model.pt2",
+    )
+```
 
 The model repository should look like:
 
@@ -115,29 +154,19 @@ The model repository should look like:
 model_repository/
 `-- model_directory
     |-- 1
-    |   `-- model.pt
+    |   `-- model.pt2
     `-- config.pbtxt
 ```
 
-Where `model.pt` is the serialized representation of the model.
+Where `model.pt2` is the AOTInductor compiled package.
 
-### TorchScript Models
-
-The model repository should look like:
-
-```bash
-model_repository/
-`-- model_directory
-    |-- 1
-    |   `-- model.pt
-    `-- config.pbtxt
-```
-
-The `model.pt` is the TorchScript model file.
+> [!NOTE]
+> AOTInductor models do not support string/bytes input or output types.
+> All inputs and outputs must be tensor types.
 
 ## Configuration
 
-Triton exposes some flags to control the execution mode of the TorchScript models through the `Parameters` section of the model's `config.pbtxt` file.
+Triton exposes some flags to control the execution mode of AOTInductor models through the `Parameters` section of the model's `config.pbtxt` file.
 
 ### Configuration Options
 
@@ -147,42 +176,18 @@ Triton exposes some flags to control the execution mode of the TorchScript model
   The model config specifying the option would look like:
 
   ```proto
-  default_model_name: "another_file_name.pt"
+  default_model_name: "another_file_name.pt2"
   ```
 
 ### Parameters
 
-* `DISABLE_OPTIMIZED_EXECUTION`:
-  Boolean flag to disable the optimized execution of TorchScript models.
-  By default, the optimized execution is always enabled.
-
-  The initial calls to a loaded TorchScript model take a significant amount of time.
-  Due to this longer model warmup
-  ([pytorch #57894](https://github.com/pytorch/pytorch/issues/57894)),
-  Triton also allows execution of models without these optimizations.
-  In some models, optimized execution does not benefit performance
-  ([pytorch #19978](https://github.com/pytorch/pytorch/issues/19978))
-  and in other cases impacts performance negatively
-  ([pytorch #53824](https://github.com/pytorch/pytorch/issues/53824)).
-
-  The section of model config file specifying this parameter will look like:
-
-  ```proto
-  parameters: {
-    key: "DISABLE_OPTIMIZED_EXECUTION"
-    value: { string_value: "true" }
-  }
-  ```
-
 * `INFERENCE_MODE`:
 
-  Boolean flag to enable the Inference Mode execution of TorchScript models.
+  Boolean flag to enable the Inference Mode execution of PyTorch models.
   By default, the inference mode is enabled.
 
-  [InferenceMode](https://pytorch.org/cppdocs/notes/inference_mode.html) is a new RAII guard analogous to `NoGradMode` to be used when you are certain your operations will have no interactions with autograd.
+  [InferenceMode](https://pytorch.org/cppdocs/notes/inference_mode.html) is a RAII guard analogous to `NoGradMode` to be used when you are certain your operations will have no interactions with autograd.
   Compared to `NoGradMode`, code run under this mode gets better performance by disabling autograd.
-
-  Please note that in some models, InferenceMode might not benefit performance and in fewer cases might impact performance negatively.
 
   To enable inference mode, use the configuration example below:
 
@@ -257,7 +262,7 @@ Triton exposes some flags to control the execution mode of the TorchScript model
 
   > [!TIP]
   > Refer to
-  > [CPU Threading TorchScript](https://pytorch.org/docs/stable/notes/cpu_threading_torchscript_inference.html)
+  > [CPU Threading](https://pytorch.org/docs/stable/notes/cpu_threading_torchscript_inference.html)
   > on how to set this parameter properly.
 
   To set the inter-op thread count, use the configuration example below:
@@ -283,7 +288,7 @@ Triton exposes some flags to control the execution mode of the TorchScript model
 
   > [!TIP]
   > Refer to
-  > [CPU Threading TorchScript](https://pytorch.org/docs/stable/notes/cpu_threading_torchscript_inference.html)
+  > [CPU Threading](https://pytorch.org/docs/stable/notes/cpu_threading_torchscript_inference.html)
   > on how to set this parameter properly.
 
   To set the intra-op thread count, use the configuration example below:
@@ -294,15 +299,6 @@ Triton exposes some flags to control the execution mode of the TorchScript model
     value: { string_value: "1" }
   }
   ```
-
-* **Additional Optimizations**:
-
-  Three additional boolean parameters are available to disable certain Torch optimizations that can sometimes cause latency regressions in models with complex execution modes and dynamic shapes.
-  If not specified, all are enabled by default.
-
-    `ENABLE_JIT_EXECUTOR`
-
-    `ENABLE_JIT_PROFILING`
 
 ### Model Instance Group Kind
 
@@ -352,18 +348,7 @@ The following PyTorch settings may be customized by setting parameters on the
 [`torch.set_num_interop_threads(int)`](https://pytorch.org/docs/stable/generated/torch.set_num_interop_threads.html#torch.set_num_interop_threads)
 
 * Key: `NUM_INTEROP_THREADS`
-* Value: The number of threads used for interop parallelism (e.g. in JIT interpreter) on CPU.
-
-[`torch.compile()` parameters](https://pytorch.org/docs/stable/generated/torch.compile.html#torch-compile)
-
-* Key: `TORCH_COMPILE_OPTIONAL_PARAMETERS`
-* Value: Any of following parameter(s) encoded as a JSON object.
-  * `fullgraph` (`bool`): Whether it is ok to break model into several subgraphs.
-  * `dynamic` (`bool`): Use dynamic shape tracing.
-  * `backend` (`str`): The backend to be used.
-  * `mode` (`str`): Can be either `"default"`, `"reduce-overhead"`, or `"max-autotune"`.
-  * `options` (`dict`): A dictionary of options to pass to the backend.
-  * `disable` (`bool`): Turn `torch.compile()` into a no-op for testing.
+* Value: The number of threads used for interop parallelism on CPU.
 
 For example:
 
@@ -371,10 +356,6 @@ For example:
 parameters: {
   key: "NUM_THREADS"
   value: { string_value: "4" }
-}
-parameters: {
-  key: "TORCH_COMPILE_OPTIONAL_PARAMETERS"
-  value: { string_value: "{\"disable\": true}" }
 }
 ```
 
@@ -389,35 +370,9 @@ parameters: {
 
   * The PyTorch model in such cases may or may not recover from the failed state and a restart of the server may be required to continue serving successfully.
 
-* PyTorch does not support Tensor of Strings but it does support models that accept a List of Strings as input(s) / produces a List of String as output(s).
-  For these models Triton allows users to pass String input(s)/receive String output(s) using the String datatype.
-  As a limitation of using List instead of Tensor for String I/O, only for 1-dimensional input(s)/output(s) are supported for I/O of String type.
-
-* In a multi-GPU environment, a potential runtime issue can occur when using
-  [Tracing](https://pytorch.org/docs/stable/generated/torch.jit.trace.html)
-  to generate a
-  [TorchScript](https://pytorch.org/docs/stable/jit.html)
-  model.
-  This issue arises due to a device mismatch between the model instance and the tensor.
-
-  By default, Triton creates a single execution instance of the model for each available GPU.
-  The runtime error occurs when a request is sent to a model instance with a different GPU device from the one used during the TorchScript generation process.
-
-  To address this problem, it is highly recommended to use
-  [Scripting](https://pytorch.org/docs/stable/generated/torch.jit.script.html#torch.jit.script)
-  instead of Tracing for model generation in a multi-GPU environment.
-  Scripting avoids the device mismatch issue and ensures compatibility with different GPUs when used with Triton.
-
-  However, if using Tracing is unavoidable, there is a workaround available.
-  You can explicitly specify the GPU device for the model instance in the
-  [model configuration](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_configuration.md#instance-groups)
-  to ensure that the model instance and the tensors used for inference are assigned to the same GPU device as on which the model was traced.
+* AOTInductor models do not support string/bytes input or output types. All inputs and outputs must be tensor types.
 
 * When using `KIND_MODEL` as model instance kind, the default device of the first parameter on the model is used.
 
-> [!WARNING]
->
-> * Python functions optimizable by `torch.compile` may not be served directly in the `model.py` file, they need to be enclosed by a class extending the
-  [`torch.nn.Module`](https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module).
->
-> * Model weights cannot be shared across multiple instances on the same GPU device.
+* In a multi-GPU environment, ensure that the AOTInductor model was compiled for the correct device. By default, Triton creates a single execution instance of the model for each available GPU. You can explicitly specify the GPU device for the model instance in the
+  [model configuration](https://github.com/triton-inference-server/server/blob/main/docs/user_guide/model_configuration.md#instance-groups).
