@@ -267,9 +267,24 @@ ModelInstanceState::Execute(
 
     torch::NoGradGuard no_grad;
 
+#ifdef TRITON_ENABLE_GPU
+    // Whole-forward CUDA-graph path (opt-in via ENABLE_CUDA_GRAPH, GPU only):
+    // capture-on-first-use + replay for a fixed input shape. Falls through to the
+    // eager run below if capture is not possible for these inputs.
+    if (model_state_->EnabledCudaGraph() && !device_.is_cpu()) {
+      if (ExecuteWithCudaGraph(input_tensors, output_tensors)) {
+        return;
+      }
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          "CUDA-graph execution unavailable for this input shape; falling back "
+          "to eager AOTInductor run.");
+    }
+#endif
+
     // Run the AOTInductor model (launches kernels asynchronously)
     std::vector<torch::Tensor> model_outputs = aoti_model_->run(*input_tensors);
-    
+
 #ifdef TRITON_ENABLE_GPU
     // Synchronize the stream to wait for kernels to complete
     // This is necessary because aoti_model_->run() launches kernels asynchronously
@@ -277,7 +292,7 @@ ModelInstanceState::Execute(
       cudaStreamSynchronize(GetCudaStreamByInstanceKind());
     }
 #endif
-    
+
     // Copy outputs to the output vector
     for (auto& output : model_outputs) {
       output_tensors->push_back(output);
@@ -325,6 +340,142 @@ ModelInstanceState::GetCudaStreamByInstanceKind()
 #endif
   return nullptr;
 }
+
+#ifdef TRITON_ENABLE_GPU
+std::string
+ModelInstanceState::InputShapeKey(
+    const std::vector<torch::Tensor>& inputs) const
+{
+  // Shape-only key: the AOTI .pt2 is static-shape, so a given (R, bucket) maps
+  // to exactly one captured graph. dtypes/order are fixed for a model.
+  std::string key;
+  for (const auto& t : inputs) {
+    for (const auto d : t.sizes()) {
+      key += std::to_string(d);
+      key += ',';
+    }
+    key += '|';
+  }
+  return key;
+}
+
+bool
+ModelInstanceState::ExecuteWithCudaGraph(
+    std::vector<torch::Tensor>* input_tensors,
+    std::vector<torch::Tensor>* output_tensors)
+{
+  const std::string key = InputShapeKey(*input_tensors);
+  // We run on a dedicated capture/replay stream; restore the caller's current
+  // stream on every exit.
+  const c10::cuda::CUDAStream prev_stream =
+      c10::cuda::getCurrentCUDAStream(device_.index());
+  auto it = cuda_graph_cache_.find(key);
+
+  // ---- Capture on first use of this shape ----
+  if (it == cuda_graph_cache_.end()) {
+    // Raw pointer so a FAILED capture can LEAK the graph: after a failed
+    // capture at::cuda::CUDAGraph's destructor can throw a second error ->
+    // std::terminate, so we must not let it run. A capture failure is a rare
+    // safety-net path (the intended static shape captures cleanly).
+    at::cuda::CUDAGraph* graph = nullptr;
+    try {
+      // Low-level CUDA runner: run_with_cuda_stream runs AOTI on the capture
+      // stream (the pattern proven by the route-c de-risk spike). Requires the
+      // loader to have been built run_single_threaded (ENABLE_CUDA_GRAPH).
+      auto* runner =
+          static_cast<torch::inductor::AOTIModelContainerRunnerCuda*>(
+              aoti_model_->get_runner());
+      if (runner == nullptr) {
+        return false;
+      }
+
+      // Dedicated stream so AOTI's caching-allocator scratch is captured on it.
+      c10::cuda::CUDAStream stream = c10::cuda::getStreamFromPool(
+          /*isHighPriority=*/false, device_.index());
+      c10::cuda::setCurrentCUDAStream(stream);
+
+      // Fixed-address input buffers (the graph replays into the same addresses).
+      std::vector<torch::Tensor> static_inputs;
+      static_inputs.reserve(input_tensors->size());
+      for (const auto& t : *input_tensors) {
+        static_inputs.push_back(t.clone());
+      }
+
+      // Warm up (allocate AOTI workspaces / autotune) before capture.
+      for (int i = 0; i < 3; ++i) {
+        (void)runner->run_with_cuda_stream(static_inputs, stream);
+      }
+      stream.synchronize();
+
+      // Capture. Relaxed mode matches the proven spike.
+      graph = new at::cuda::CUDAGraph();
+      graph->capture_begin({0, 0}, cudaStreamCaptureModeRelaxed);
+      std::vector<torch::Tensor> static_outputs =
+          runner->run_with_cuda_stream(static_inputs, stream);
+      graph->capture_end();
+      stream.synchronize();
+
+      CudaGraphEntry entry{
+          std::unique_ptr<at::cuda::CUDAGraph>(graph), std::move(static_inputs),
+          std::move(static_outputs), stream};
+      it = cuda_graph_cache_.emplace(key, std::move(entry)).first;
+
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Captured CUDA graph for input shape '") + key +
+           "' on model instance '" + Name() + "'")
+              .c_str());
+    }
+    catch (const std::exception& ex) {
+      // Best-effort: pull the caching allocator out of capture mode, then LEAK
+      // the graph (don't delete -> its dtor never runs). Fall back to eager.
+      if (graph != nullptr) {
+        try {
+          graph->capture_end();
+        }
+        catch (...) {
+        }
+      }
+      c10::cuda::setCurrentCUDAStream(prev_stream);
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string("CUDA-graph capture failed (") + ex.what() +
+           "); falling back to eager for shape '" + key + "'")
+              .c_str());
+      return false;
+    }
+  }
+
+  // ---- Replay (also runs the just-captured graph on first use) ----
+  try {
+    CudaGraphEntry& e = it->second;
+    c10::cuda::setCurrentCUDAStream(e.stream);
+    for (size_t i = 0; i < input_tensors->size(); ++i) {
+      e.static_inputs[i].copy_((*input_tensors)[i]);
+    }
+    e.graph->replay();
+    e.stream.synchronize();
+
+    // Outputs live in the graph's fixed buffers; clone so the next replay and
+    // the Triton output responder don't race on them.
+    for (const auto& o : e.static_outputs) {
+      output_tensors->push_back(o.clone());
+    }
+
+    c10::cuda::setCurrentCUDAStream(prev_stream);
+    return true;
+  }
+  catch (const std::exception& ex) {
+    c10::cuda::setCurrentCUDAStream(prev_stream);
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        (std::string("CUDA-graph replay failed (") + ex.what() +
+         "); falling back to eager for shape '" + key + "'")
+            .c_str());
+    return false;
+  }
+}
+#endif
 
 TRITONSERVER_Error*
 ModelInstanceState::GetNamingConvention(

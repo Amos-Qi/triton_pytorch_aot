@@ -46,6 +46,12 @@
 #include "triton/common/nvtx.h"
 #include "triton/core/tritonbackend.h"
 
+#ifdef TRITON_ENABLE_GPU
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/inductor/aoti_runner/model_container_runner_cuda.h>
+#endif
+
 
 namespace triton::backend::pytorch {
 
@@ -87,6 +93,21 @@ class ModelInstanceState : public BackendModelInstance {
 
   // The number of available devices.
   int device_cnt_;
+
+#ifdef TRITON_ENABLE_GPU
+  // One captured whole-forward CUDA graph + its fixed I/O buffers and dedicated
+  // capture/replay stream, keyed by input-shape signature. Populated lazily on
+  // the first request of each shape and replayed on subsequent matching
+  // requests. Only used when ModelState::EnabledCudaGraph() is true (which
+  // requires a static-shape .pt2 and a run_single_threaded loader).
+  struct CudaGraphEntry {
+    std::unique_ptr<at::cuda::CUDAGraph> graph;
+    std::vector<torch::Tensor> static_inputs;
+    std::vector<torch::Tensor> static_outputs;
+    c10::cuda::CUDAStream stream;
+  };
+  std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
+#endif
 
  public:
   virtual ~ModelInstanceState();
@@ -130,6 +151,19 @@ class ModelInstanceState : public BackendModelInstance {
   // Get the appropriate CUDA stream for input and output handling based on
   // the instance group type.
   cudaStream_t GetCudaStreamByInstanceKind();
+
+#ifdef TRITON_ENABLE_GPU
+  // Build a stable key from the input tensor shapes for the CUDA-graph cache.
+  std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
+
+  // Capture-on-first-use + replay of the AOTI model for these (static-shape)
+  // inputs on a dedicated stream. Returns false if capture is not possible
+  // (the caller then falls back to eager aoti_model_->run). On success appends
+  // the cloned model outputs to output_tensors.
+  bool ExecuteWithCudaGraph(
+      std::vector<torch::Tensor>* input_tensors,
+      std::vector<torch::Tensor>* output_tensors);
+#endif
 
   // Get the naming convention for inputs/outputs from the model configuration
   TRITONSERVER_Error* GetNamingConvention(

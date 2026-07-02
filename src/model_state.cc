@@ -39,8 +39,8 @@ namespace triton::backend::pytorch {
 ModelState::ModelState(TRITONBACKEND_Model* triton_model)
     : BackendModel(triton_model), enable_inference_mode_(true),
       enable_cudnn_(true), enable_cache_cleaning_(false),
-      enable_weight_sharing_(false), disable_pinned_input_(false),
-      total_instance_count_(1)
+      enable_weight_sharing_(false), enable_cuda_graph_(false),
+      disable_pinned_input_(false), total_instance_count_(1)
 {
 }
 
@@ -175,6 +175,12 @@ ModelState::EnabledWeightSharing()
 }
 
 bool
+ModelState::EnabledCudaGraph()
+{
+  return enable_cuda_graph_;
+}
+
+bool
 ModelState::IsPinnedInputDisabled() const
 {
   return disable_pinned_input_;
@@ -249,10 +255,19 @@ ModelState::LoadModel(
     // count to allow concurrent inference from all instances sharing the model.
     size_t num_runners = enable_weight_sharing_ ? total_instance_count_ : 1;
 
+    // CUDA-graph capture requires the loader to run single-threaded (one runner,
+    // no worker-thread stream join) -- otherwise capture fails with "operation
+    // not permitted when stream is capturing" (pytorch/pytorch@85467ed). This
+    // overrides weight sharing's multi-runner setting for the graph path.
+    const bool run_single_threaded = enable_cuda_graph_;
+    if (enable_cuda_graph_) {
+      num_runners = 1;
+    }
+
     // Load the AOTInductor package
     aoti_model->reset(new torch::inductor::AOTIModelPackageLoader(
-        *model_path, "model" /* model_name */, false /* run_single_threaded */,
-        num_runners, device_index));
+        *model_path, "model" /* model_name */, run_single_threaded, num_runners,
+        device_index));
 
     LOG_MESSAGE(
         TRITONSERVER_LOG_INFO,
@@ -363,6 +378,24 @@ ModelState::ParseParameters()
           TRITONSERVER_LOG_INFO,
           (std::string("Weight sharing is ") +
            (enable_weight_sharing_ ? "enabled" : "disabled") +
+           " for model instance '" + Name() + "'")
+              .c_str());
+    }
+
+    // If 'ENABLE_CUDA_GRAPH' is not present in 'parameters' then no update is
+    // made to 'enable_cuda_graph_' (defaults to false).
+    err = ParseParameter(params, "ENABLE_CUDA_GRAPH", &enable_cuda_graph_);
+    if (err != nullptr) {
+      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
+        return err;
+      } else {
+        TRITONSERVER_ErrorDelete(err);
+      }
+    } else {
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("CUDA graph capture/replay is ") +
+           (enable_cuda_graph_ ? "enabled" : "disabled") +
            " for model instance '" + Name() + "'")
               .c_str());
     }

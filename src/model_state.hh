@@ -66,6 +66,12 @@ class ModelState : public triton::backend::BackendModel {
   // Flag to indicate whether weight sharing is enabled. Defaults to false.
   bool enable_weight_sharing_;
 
+  // Flag to enable whole-forward CUDA-graph capture/replay of the AOTInductor
+  // model (ENABLE_CUDA_GRAPH parameter). Requires a static-shape .pt2. When on,
+  // the loader is built run_single_threaded (single runner) so capture is legal.
+  // Defaults to false (unchanged eager-AOTI path).
+  bool enable_cuda_graph_;
+
   // Flag to disable pinned input memory. Defaults to false (pinned input enabled by default).
   bool disable_pinned_input_;
 
@@ -102,6 +108,9 @@ class ModelState : public triton::backend::BackendModel {
   bool EnabledInferenceMode();
 
   bool EnabledWeightSharing();
+
+  // Whether whole-forward CUDA-graph capture/replay is enabled for this model.
+  bool EnabledCudaGraph();
 
   // Check if pinned input is disabled
   bool IsPinnedInputDisabled() const;
