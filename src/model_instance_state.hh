@@ -32,6 +32,7 @@
 #include <exception>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "libtorch_utils.h"
@@ -107,6 +108,10 @@ class ModelInstanceState : public BackendModelInstance {
     c10::cuda::CUDAStream stream;
   };
   std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
+
+  // Negative cache: input-shape keys whose capture failed once. We go straight to eager for these
+  // (no re-warmup + re-capture + graph leak on every subsequent request of the same shape).
+  std::unordered_set<std::string> cuda_graph_failed_;
 #endif
 
  public:

@@ -365,6 +365,11 @@ ModelInstanceState::ExecuteWithCudaGraph(
     std::vector<torch::Tensor>* output_tensors)
 {
   const std::string key = InputShapeKey(*input_tensors);
+  // Negative cache: a shape that failed capture once goes straight to eager (no re-warmup +
+  // re-capture + graph leak on every subsequent request of that shape).
+  if (cuda_graph_failed_.find(key) != cuda_graph_failed_.end()) {
+    return false;
+  }
   // We run on a dedicated capture/replay stream; restore the caller's current
   // stream on every exit.
   const c10::cuda::CUDAStream prev_stream =
@@ -436,11 +441,12 @@ ModelInstanceState::ExecuteWithCudaGraph(
         catch (...) {
         }
       }
+      cuda_graph_failed_.insert(key);  // don't retry this shape (negative cache)
       c10::cuda::setCurrentCUDAStream(prev_stream);
       LOG_MESSAGE(
           TRITONSERVER_LOG_WARN,
           (std::string("CUDA-graph capture failed (") + ex.what() +
-           "); falling back to eager for shape '" + key + "'")
+           "); falling back to eager (and pinning eager) for shape '" + key + "'")
               .c_str());
       return false;
     }
@@ -450,6 +456,9 @@ ModelInstanceState::ExecuteWithCudaGraph(
   try {
     CudaGraphEntry& e = it->second;
     c10::cuda::setCurrentCUDAStream(e.stream);
+    // The input tensors were produced on the instance stream (SetInputTensors); make sure that work
+    // is complete before we copy_ them on the graph stream, else the copy races the producer (risk #9).
+    cudaStreamSynchronize(GetCudaStreamByInstanceKind());
     for (size_t i = 0; i < input_tensors->size(); ++i) {
       e.static_inputs[i].copy_((*input_tensors)[i]);
     }
