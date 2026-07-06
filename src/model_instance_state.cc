@@ -28,6 +28,7 @@
 
 #include "string_utils.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -359,14 +360,73 @@ ModelInstanceState::InputShapeKey(
   return key;
 }
 
+std::vector<torch::Tensor>
+ModelInstanceState::PadRequestsUp(
+    const std::vector<torch::Tensor>& inputs, int64_t r, int64_t bucket) const
+{
+  // v3_q3a request-batch layout: [0] packed_single (R, F1), [1] packed_multiple flat (R*per,),
+  // [2] request_end_position (R,) = cumsum of per-request element counts. Pad R -> bucket by appending
+  // zero rows to the packed tensors (dummy requests are inert -- candidate queries attend only to their
+  // own request's user-history KV, never across requests; their output rows are sliced off), and
+  // regenerate the cumsum (a zero-padded cumsum would be wrong).
+  std::vector<torch::Tensor> out;
+  out.reserve(inputs.size());
+  const int64_t per = inputs[1].numel() / r;  // elements/request (uniform: candidates padded to bucket)
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const torch::Tensor& t = inputs[i];
+    if (i == 2) {
+      auto rep = torch::arange(
+                     1, bucket + 1,
+                     torch::TensorOptions().dtype(torch::kLong).device(t.device())) *
+                 per;
+      out.push_back(rep.to(t.scalar_type()));
+    } else {
+      auto sizes = t.sizes().vec();
+      sizes[0] = sizes[0] / r * bucket;  // scale leading dim R->bucket (packed_single; flat multiple)
+      auto padded = torch::zeros(sizes, t.options());
+      padded.narrow(0, 0, t.size(0)).copy_(t);
+      out.push_back(padded);
+    }
+  }
+  return out;
+}
+
 bool
 ModelInstanceState::ExecuteWithCudaGraph(
     std::vector<torch::Tensor>* input_tensors,
     std::vector<torch::Tensor>* output_tensors)
 {
-  const std::string key = InputShapeKey(*input_tensors);
-  // Negative cache: a shape that failed capture once goes straight to eager (no re-warmup +
-  // re-capture + graph leak on every subsequent request of that shape).
+  // Only the v3_q3a 3-input request-batch layout is R-bucketed; any other layout -> eager.
+  if (input_tensors->size() != 3) {
+    return false;
+  }
+  // Request count R = smallest leading dim (packed_single & request_end_position are (R,...);
+  // packed_multiple is (R*per,), larger).
+  int64_t r = (*input_tensors)[0].size(0);
+  for (const auto& t : *input_tensors) {
+    r = std::min<int64_t>(r, t.size(0));
+  }
+  // Pick the R bucket: smallest allowlisted bucket >= r. Empty allowlist -> capture the exact shape.
+  const auto& buckets = model_state_->CudaGraphBatchSizes();
+  int64_t bucket = r;
+  if (!buckets.empty()) {
+    auto b_it = buckets.lower_bound(r);
+    if (b_it == buckets.end()) {
+      return false;  // R above the largest bucket -> eager on the dynamic artifact
+    }
+    bucket = *b_it;
+  }
+  // Pad R up to the bucket with dummy requests (no-op if the batch already equals a bucket).
+  std::vector<torch::Tensor> padded_storage;
+  const std::vector<torch::Tensor>* inputs_at_bucket = input_tensors;
+  if (bucket != r) {
+    padded_storage = PadRequestsUp(*input_tensors, r, bucket);
+    inputs_at_bucket = &padded_storage;
+  }
+
+  // One graph per R bucket (all r that pad to the same bucket share it).
+  const std::string key = "R=" + std::to_string(bucket);
+  // Negative cache: a bucket that failed capture once goes straight to eager (no retry storm / leak).
   if (cuda_graph_failed_.find(key) != cuda_graph_failed_.end()) {
     return false;
   }
@@ -399,10 +459,10 @@ ModelInstanceState::ExecuteWithCudaGraph(
           /*isHighPriority=*/false, device_.index());
       c10::cuda::setCurrentCUDAStream(stream);
 
-      // Fixed-address input buffers (the graph replays into the same addresses).
+      // Fixed-address input buffers (the graph replays into the same addresses), at the bucket shape.
       std::vector<torch::Tensor> static_inputs;
-      static_inputs.reserve(input_tensors->size());
-      for (const auto& t : *input_tensors) {
+      static_inputs.reserve(inputs_at_bucket->size());
+      for (const auto& t : *inputs_at_bucket) {
         static_inputs.push_back(t.clone());
       }
 
@@ -427,8 +487,8 @@ ModelInstanceState::ExecuteWithCudaGraph(
 
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
-          (std::string("Captured CUDA graph for input shape '") + key +
-           "' on model instance '" + Name() + "'")
+          (std::string("Captured CUDA graph for bucket ") + key + " (shape " +
+           InputShapeKey(*inputs_at_bucket) + ") on model instance '" + Name() + "'")
               .c_str());
     }
     catch (const std::exception& ex) {
@@ -459,16 +519,17 @@ ModelInstanceState::ExecuteWithCudaGraph(
     // The input tensors were produced on the instance stream (SetInputTensors); make sure that work
     // is complete before we copy_ them on the graph stream, else the copy races the producer (risk #9).
     cudaStreamSynchronize(GetCudaStreamByInstanceKind());
-    for (size_t i = 0; i < input_tensors->size(); ++i) {
-      e.static_inputs[i].copy_((*input_tensors)[i]);
+    for (size_t i = 0; i < inputs_at_bucket->size(); ++i) {
+      e.static_inputs[i].copy_((*inputs_at_bucket)[i]);
     }
     e.graph->replay();
     e.stream.synchronize();
 
-    // Outputs live in the graph's fixed buffers; clone so the next replay and
-    // the Triton output responder don't race on them.
+    // Slice each output's batch dim (dim 0 = R) back to the real request count -- the padded (dummy)
+    // request rows are discarded. clone so the next replay + the Triton responder don't race on the
+    // static output buffers.
     for (const auto& o : e.static_outputs) {
-      output_tensors->push_back(o.clone());
+      output_tensors->push_back((r == bucket ? o : o.narrow(0, 0, r)).clone());
     }
 
     c10::cuda::setCurrentCUDAStream(prev_stream);

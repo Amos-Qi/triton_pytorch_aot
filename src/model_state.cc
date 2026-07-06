@@ -400,6 +400,39 @@ ModelState::ParseParameters()
               .c_str());
     }
 
+    // 'CUDA_GRAPH_BATCH_SIZES' (comma-separated R buckets) -> the allowlist the backend captures graphs
+    // at + pads batches up to. Empty (param absent) => capture any first-seen shape (unbounded).
+    {
+      triton::common::TritonJson::Value cbs;
+      if (params.Find("CUDA_GRAPH_BATCH_SIZES", &cbs)) {
+        std::string val;
+        TRITONSERVER_Error* serr = cbs.MemberAsString("string_value", &val);
+        if (serr != nullptr) {
+          TRITONSERVER_ErrorDelete(serr);
+        } else {
+          size_t start = 0;
+          while (start < val.size()) {
+            size_t comma = val.find(',', start);
+            std::string tok = val.substr(
+                start, comma == std::string::npos ? std::string::npos : comma - start);
+            try {
+              cuda_graph_batch_sizes_.insert(std::stoll(tok));
+            }
+            catch (...) {
+            }
+            if (comma == std::string::npos) {
+              break;
+            }
+            start = comma + 1;
+          }
+          LOG_MESSAGE(
+              TRITONSERVER_LOG_INFO,
+              (std::string("CUDA graph R buckets: '") + val + "' for model instance '" + Name() + "'")
+                  .c_str());
+        }
+      }
+    }
+
     // If 'DISABLE_PINNED_INPUT' is not present in 'parameters' then no
     // update is made to 'disable_pinned_input_'.
     bool disable_pinned_input = false;

@@ -161,6 +161,11 @@ class ModelInstanceState : public BackendModelInstance {
   // Build a stable key from the input tensor shapes for the CUDA-graph cache.
   std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
 
+  // Pad the request-batch inputs from R=r up to R=bucket (dummy requests appended), so the batch can
+  // replay the bucket's captured graph. Returns the padded inputs; caller slices outputs back to r.
+  std::vector<torch::Tensor> PadRequestsUp(
+      const std::vector<torch::Tensor>& inputs, int64_t r, int64_t bucket) const;
+
   // Capture-on-first-use + replay of the AOTI model for these (static-shape)
   // inputs on a dedicated stream. Returns false if capture is not possible
   // (the caller then falls back to eager aoti_model_->run). On success appends

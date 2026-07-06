@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <set>
 
 #include "libtorch_utils.h"
 #include "naming_convention.hh"
@@ -72,6 +73,11 @@ class ModelState : public triton::backend::BackendModel {
   // Defaults to false (unchanged eager-AOTI path).
   bool enable_cuda_graph_;
 
+  // R (request-batch) buckets to capture whole-forward CUDA graphs for (CUDA_GRAPH_BATCH_SIZES).
+  // A batch is padded UP to the nearest bucket >= its R, replayed, and sliced; R above the max bucket
+  // (or an empty set) falls back to eager. Empty = capture any first-seen shape (unbounded).
+  std::set<int64_t> cuda_graph_batch_sizes_;
+
   // Flag to disable pinned input memory. Defaults to false (pinned input enabled by default).
   bool disable_pinned_input_;
 
@@ -111,6 +117,9 @@ class ModelState : public triton::backend::BackendModel {
 
   // Whether whole-forward CUDA-graph capture/replay is enabled for this model.
   bool EnabledCudaGraph();
+
+  // The R buckets to capture CUDA graphs at (empty => capture any first-seen shape).
+  const std::set<int64_t>& CudaGraphBatchSizes() const { return cuda_graph_batch_sizes_; }
 
   // Check if pinned input is disabled
   bool IsPinnedInputDisabled() const;
