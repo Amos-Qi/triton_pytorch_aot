@@ -25,6 +25,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "model_state.hh"
+#include "cuda_graph_bucketing.h"
 
 #include <mutex>
 
@@ -582,21 +583,7 @@ ModelState::ParseParameters()
         if (serr != nullptr) {
           TRITONSERVER_ErrorDelete(serr);
         } else {
-          size_t start = 0;
-          while (start < val.size()) {
-            size_t comma = val.find(',', start);
-            std::string tok = val.substr(
-                start, comma == std::string::npos ? std::string::npos : comma - start);
-            try {
-              cuda_graph_batch_sizes_.insert(std::stoll(tok));
-            }
-            catch (...) {
-            }
-            if (comma == std::string::npos) {
-              break;
-            }
-            start = comma + 1;
-          }
+          cuda_graph_batch_sizes_ = ParseCsvInt64Set(val);
           LOG_MESSAGE(
               TRITONSERVER_LOG_INFO,
               (std::string("CUDA graph R buckets: '") + val + "' for model instance '" + Name() + "'")

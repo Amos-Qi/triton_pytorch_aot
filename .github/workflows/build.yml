@@ -1,0 +1,71 @@
+# Copyright 2019-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#  * Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#  * Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#  * Neither the name of NVIDIA CORPORATION nor the names of its
+#    contributors may be used to endorse or promote products derived
+#    from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ``AS IS'' AND ANY
+# EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.  IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DAMAGES ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE.
+
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Fast, host-only unit tests of the pure CUDA-graph bucketing helpers.
+  # No CUDA / Triton / torch -- runs on a plain runner in seconds.
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S test -B build-test -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-test -j
+      - name: Test
+        run: ctest --test-dir build-test --output-on-failure
+
+  # Full backend compile check against Triton r26.01 + torch 2.12 (mirrors
+  # Dockerfile.aottriton). No GPU is needed to COMPILE the CUDA code -- the base
+  # image ships the CUDA toolkit + headers. This is what keeps the C++ honest.
+  #
+  # NOTE: nvcr.io/nvidia/tritonserver is normally pullable without auth. If the
+  # pull is denied on your runner, add an NGC token as a secret and a
+  # `docker login nvcr.io` step (or a registry credential on the container).
+  build-backend:
+    runs-on: ubuntu-latest
+    container:
+      image: nvcr.io/nvidia/tritonserver:26.01-pyt-python-py3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            build-essential cmake libssl-dev rapidjson-dev patchelf \
+            git ca-certificates
+      - name: Install torch
+        run: pip install --no-cache-dir torch==2.12.0
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DTRITON_PYTORCH_LIB_PATHS="/usr/local/lib/python3.12/dist-packages/torch/lib" \
+            -DTRITON_PYTORCH_INCLUDE_PATHS="/usr/local/lib/python3.12/dist-packages/torch/include;/usr/local/lib/python3.12/dist-packages/torch/include/torch/csrc/api/include" \
+            -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
+            -DTRITON_PYTORCH_NVSHMEM=OFF \
+            -DTRITON_BACKEND_REPO_TAG=r26.01 \
+            -DTRITON_CORE_REPO_TAG=r26.01 \
+            -DTRITON_COMMON_REPO_TAG=r26.01
+      - name: Build (compile + link the backend .so)
+        run: cmake --build build -j

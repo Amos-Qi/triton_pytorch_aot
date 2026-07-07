@@ -26,6 +26,7 @@
 
 #include "model_instance_state.hh"
 
+#include "cuda_graph_bucketing.h"
 #include "string_utils.hh"
 
 #include <algorithm>
@@ -656,7 +657,7 @@ ModelInstanceState::ExecuteWithCudaGraph(
     c10::cuda::setCurrentCUDAStream(prev_stream);
     model_state_->CudaGraphMetricReplay(bucket);
     if (bucket > r) {
-      model_state_->CudaGraphMetricPadWaste(bucket, bucket - r);
+      model_state_->CudaGraphMetricPadWaste(bucket, PadWasteRows(r, bucket));
     }
     return true;
   }
