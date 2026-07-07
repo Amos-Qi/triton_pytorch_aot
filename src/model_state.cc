@@ -40,8 +40,180 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
     : BackendModel(triton_model), enable_inference_mode_(true),
       enable_cudnn_(true), enable_cache_cleaning_(false),
       enable_weight_sharing_(false), enable_cuda_graph_(false),
-      disable_pinned_input_(false), total_instance_count_(1)
+      disable_pinned_input_(false), total_instance_count_(1),
+      cuda_graph_warmup_single_width_(0), cuda_graph_warmup_multi_width_(0)
 {
+}
+
+ModelState::~ModelState()
+{
+  // Metrics must be deleted before their families. Only non-null handles were
+  // ever created (see InitCudaGraphMetrics / GetOrCreateBucketMetric).
+  for (auto& entry : cuda_graph_bucket_metrics_) {
+    if (entry.second != nullptr) {
+      LOG_IF_ERROR(
+          TRITONSERVER_MetricDelete(entry.second),
+          "Failed to delete CUDA-graph bucket metric");
+    }
+  }
+  if (metric_eager_fallbacks_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricDelete(metric_eager_fallbacks_),
+        "Failed to delete CUDA-graph eager-fallback metric");
+  }
+  if (metric_family_replays_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricFamilyDelete(metric_family_replays_),
+        "Failed to delete cudagraph_replays_total family");
+  }
+  if (metric_family_pad_waste_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricFamilyDelete(metric_family_pad_waste_),
+        "Failed to delete cudagraph_pad_waste_rows_total family");
+  }
+  if (metric_family_eager_fallbacks_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricFamilyDelete(metric_family_eager_fallbacks_),
+        "Failed to delete cudagraph_eager_fallbacks_total family");
+  }
+  if (metric_family_capture_failures_ != nullptr) {
+    LOG_IF_ERROR(
+        TRITONSERVER_MetricFamilyDelete(metric_family_capture_failures_),
+        "Failed to delete cudagraph_capture_failures_total family");
+  }
+}
+
+void
+ModelState::InitCudaGraphMetrics()
+{
+  metric_family_replays_ = CreateCudaGraphMetricFamily(
+      "cudagraph_replays_total", "CUDA-graph replays (per R bucket)");
+  metric_family_pad_waste_ = CreateCudaGraphMetricFamily(
+      "cudagraph_pad_waste_rows_total",
+      "Padded (dummy) request rows run through CUDA-graph replay (per R bucket)");
+  metric_family_eager_fallbacks_ = CreateCudaGraphMetricFamily(
+      "cudagraph_eager_fallbacks_total",
+      "Requests that fell back to eager AOTInductor instead of a CUDA graph");
+  metric_family_capture_failures_ = CreateCudaGraphMetricFamily(
+      "cudagraph_capture_failures_total",
+      "CUDA-graph capture failures (per R bucket)");
+
+  // The eager-fallback counter is unlabeled -> one metric for the whole model.
+  if (metric_family_eager_fallbacks_ != nullptr) {
+    TRITONSERVER_Error* err = TRITONSERVER_MetricNew(
+        &metric_eager_fallbacks_, metric_family_eager_fallbacks_,
+        nullptr /* labels */, 0 /* label_count */);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+      metric_eager_fallbacks_ = nullptr;
+    }
+  }
+}
+
+TRITONSERVER_MetricFamily*
+ModelState::CreateCudaGraphMetricFamily(
+    const char* name, const char* description)
+{
+  TRITONSERVER_MetricFamily* family = nullptr;
+  TRITONSERVER_Error* err = TRITONSERVER_MetricFamilyNew(
+      &family, TRITONSERVER_METRIC_KIND_COUNTER, name, description);
+  if (err != nullptr) {
+    if (!cuda_graph_metrics_warned_) {
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string("Failed to create CUDA-graph metric family '") + name +
+           "' (" + TRITONSERVER_ErrorMessage(err) +
+           "); CUDA-graph metrics disabled for model '" + Name() + "'")
+              .c_str());
+      cuda_graph_metrics_warned_ = true;
+    }
+    TRITONSERVER_ErrorDelete(err);
+    return nullptr;
+  }
+  return family;
+}
+
+TRITONSERVER_Metric*
+ModelState::GetOrCreateBucketMetric(
+    TRITONSERVER_MetricFamily* family, int64_t bucket)
+{
+  if (family == nullptr) {
+    return nullptr;
+  }
+  const auto cache_key = std::make_pair(family, bucket);
+  auto it = cuda_graph_bucket_metrics_.find(cache_key);
+  if (it != cuda_graph_bucket_metrics_.end()) {
+    return it->second;
+  }
+
+  TRITONSERVER_Metric* metric = nullptr;
+  const std::string bucket_str = std::to_string(bucket);
+  TRITONSERVER_Parameter* label = TRITONSERVER_ParameterNew(
+      "bucket", TRITONSERVER_PARAMETER_STRING, bucket_str.c_str());
+  if (label != nullptr) {
+    const TRITONSERVER_Parameter* labels[1] = {label};
+    TRITONSERVER_Error* err = TRITONSERVER_MetricNew(&metric, family, labels, 1);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+      metric = nullptr;
+    }
+    TRITONSERVER_ParameterDelete(label);
+  }
+  // Cache even nullptr so a failed creation is not retried on every request.
+  cuda_graph_bucket_metrics_[cache_key] = metric;
+  return metric;
+}
+
+void
+ModelState::CudaGraphMetricReplay(int64_t bucket)
+{
+  TRITONSERVER_Metric* metric =
+      GetOrCreateBucketMetric(metric_family_replays_, bucket);
+  if (metric != nullptr) {
+    TRITONSERVER_Error* err = TRITONSERVER_MetricIncrement(metric, 1.0);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+    }
+  }
+}
+
+void
+ModelState::CudaGraphMetricPadWaste(int64_t bucket, int64_t rows)
+{
+  TRITONSERVER_Metric* metric =
+      GetOrCreateBucketMetric(metric_family_pad_waste_, bucket);
+  if (metric != nullptr) {
+    TRITONSERVER_Error* err =
+        TRITONSERVER_MetricIncrement(metric, static_cast<double>(rows));
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+    }
+  }
+}
+
+void
+ModelState::CudaGraphMetricEagerFallback()
+{
+  if (metric_eager_fallbacks_ != nullptr) {
+    TRITONSERVER_Error* err =
+        TRITONSERVER_MetricIncrement(metric_eager_fallbacks_, 1.0);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+    }
+  }
+}
+
+void
+ModelState::CudaGraphMetricCaptureFailure(int64_t bucket)
+{
+  TRITONSERVER_Metric* metric =
+      GetOrCreateBucketMetric(metric_family_capture_failures_, bucket);
+  if (metric != nullptr) {
+    TRITONSERVER_Error* err = TRITONSERVER_MetricIncrement(metric, 1.0);
+    if (err != nullptr) {
+      TRITONSERVER_ErrorDelete(err);
+    }
+  }
 }
 
 TRITONSERVER_Error*
@@ -433,6 +605,75 @@ ModelState::ParseParameters()
       }
     }
 
+    // Self-protecting override: capture/replay needs a single-runner
+    // (run_single_threaded, num_runners=1) loader per instance. Weight sharing
+    // would reuse ONE such loader across all instances (LoadModel: reuse
+    // ~229-241, register ~286-294), racing their captures/replays -- so force
+    // it off. ParseParameters runs at model init (before any LoadModel), so this
+    // override is effective; LoadModel itself is unchanged.
+    if (enable_cuda_graph_ && enable_weight_sharing_) {
+      enable_weight_sharing_ = false;
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string(
+               "ENABLE_CUDA_GRAPH=true forces ENABLE_WEIGHT_SHARING off (was "
+               "ENABLE_WEIGHT_SHARING=true): each cudagraph instance needs its "
+               "own single-runner loader + per-instance graph cache, for model "
+               "instance '") +
+           Name() + "'")
+              .c_str());
+    }
+
+    // 'CUDA_GRAPH_WARMUP_SINGLE_WIDTH' / 'CUDA_GRAPH_WARMUP_MULTI_WIDTH' (int64):
+    // packed_single's F1 width and the per-request packed_multiple element count
+    // (candidate_bucket * F2). When both > 0 (with a non-empty bucket set) the
+    // instance captures every bucket at load time (see WarmupCudaGraphs). Absent
+    // => 0 => lazy capture only.
+    {
+      triton::common::TritonJson::Value w;
+      if (params.Find("CUDA_GRAPH_WARMUP_SINGLE_WIDTH", &w)) {
+        std::string val;
+        TRITONSERVER_Error* serr = w.MemberAsString("string_value", &val);
+        if (serr != nullptr) {
+          TRITONSERVER_ErrorDelete(serr);
+        } else {
+          try {
+            cuda_graph_warmup_single_width_ = std::stoll(val);
+          }
+          catch (...) {
+          }
+          LOG_MESSAGE(
+              TRITONSERVER_LOG_INFO,
+              (std::string("CUDA graph warmup single width: ") +
+               std::to_string(cuda_graph_warmup_single_width_) +
+               " for model instance '" + Name() + "'")
+                  .c_str());
+        }
+      }
+    }
+    {
+      triton::common::TritonJson::Value w;
+      if (params.Find("CUDA_GRAPH_WARMUP_MULTI_WIDTH", &w)) {
+        std::string val;
+        TRITONSERVER_Error* serr = w.MemberAsString("string_value", &val);
+        if (serr != nullptr) {
+          TRITONSERVER_ErrorDelete(serr);
+        } else {
+          try {
+            cuda_graph_warmup_multi_width_ = std::stoll(val);
+          }
+          catch (...) {
+          }
+          LOG_MESSAGE(
+              TRITONSERVER_LOG_INFO,
+              (std::string("CUDA graph warmup multi width: ") +
+               std::to_string(cuda_graph_warmup_multi_width_) +
+               " for model instance '" + Name() + "'")
+                  .c_str());
+        }
+      }
+    }
+
     // If 'DISABLE_PINNED_INPUT' is not present in 'parameters' then no
     // update is made to 'disable_pinned_input_'.
     bool disable_pinned_input = false;
@@ -514,6 +755,12 @@ ModelState::ParseParameters()
                 .c_str());
       }
     }
+  }
+
+  // Create the CUDA-graph Prometheus counters once (best-effort). enable_cuda_graph_
+  // is final by this point; the guard makes this a no-op for the non-cudagraph path.
+  if (enable_cuda_graph_) {
+    InitCudaGraphMetrics();
   }
 
   return nullptr;

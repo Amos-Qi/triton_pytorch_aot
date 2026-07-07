@@ -89,6 +89,11 @@ class ModelInstanceState : public BackendModelInstance {
   cudaEvent_t compute_infer_start_event_;
   cudaEvent_t compute_output_start_event_;
 
+  // Persistent event used to order the CUDA-graph replay stream behind the
+  // producer (input-collection) stream without a full-device sync. Created once
+  // (KIND_GPU + ENABLE_CUDA_GRAPH) in the ctor and destroyed in the destructor.
+  cudaEvent_t cuda_graph_input_ready_event_ = nullptr;
+
   // Store the cuda streams created for the 'KIND_MODEL' instance group.
   std::vector<cudaStream_t> stream_vec_;
 
@@ -112,6 +117,12 @@ class ModelInstanceState : public BackendModelInstance {
   // Negative cache: input-shape keys whose capture failed once. We go straight to eager for these
   // (no re-warmup + re-capture + graph leak on every subsequent request of the same shape).
   std::unordered_set<std::string> cuda_graph_failed_;
+
+  // One-time guard (see ExecuteWithCudaGraph): on the first real request, compare
+  // the configured warmup widths vs the actual traffic widths and, on mismatch,
+  // evict the wrong-shape warmup captures so lazy capture re-populates at the real
+  // shape (the cache is keyed only by "R=<bucket>", not by width).
+  bool warmup_widths_checked_ = false;
 #endif
 
  public:
@@ -173,6 +184,21 @@ class ModelInstanceState : public BackendModelInstance {
   bool ExecuteWithCudaGraph(
       std::vector<torch::Tensor>* input_tensors,
       std::vector<torch::Tensor>* output_tensors);
+
+  // Capture the whole-forward AOTI graph for R=<bucket> at the given (already
+  // bucket-shaped) inputs on a dedicated stream and emplace it into
+  // cuda_graph_cache_ (keyed "R=<bucket>"). Returns false on failure: it
+  // negative-caches the bucket in cuda_graph_failed_, restores the stream, WARNs,
+  // and LEAKs the partial at::cuda::CUDAGraph (its dtor must not run). Used by both
+  // load-time warmup and lazy capture.
+  bool CaptureBucket(
+      const std::vector<torch::Tensor>& inputs_at_bucket, int64_t bucket);
+
+  // Load-time warmup: before the instance goes READY, capture every configured R
+  // bucket at zero-valued inputs of the configured warmup widths. No-op unless
+  // ENABLE_CUDA_GRAPH, both warmup widths, and a non-empty bucket set are all
+  // configured. Never throws (a warmup failure is logged; lazy capture covers it).
+  void WarmupCudaGraphs();
 #endif
 
   // Get the naming convention for inputs/outputs from the model configuration
