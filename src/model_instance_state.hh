@@ -32,6 +32,7 @@
 #include <exception>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "libtorch_utils.h"
@@ -45,6 +46,12 @@
 #include "triton/backend/backend_output_responder.h"
 #include "triton/common/nvtx.h"
 #include "triton/core/tritonbackend.h"
+
+#ifdef TRITON_ENABLE_GPU
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/inductor/aoti_runner/model_container_runner_cuda.h>
+#endif
 
 
 namespace triton::backend::pytorch {
@@ -82,11 +89,43 @@ class ModelInstanceState : public BackendModelInstance {
   cudaEvent_t compute_infer_start_event_;
   cudaEvent_t compute_output_start_event_;
 
+  // Persistent event used to order the CUDA-graph replay stream behind the
+  // producer (input-collection) stream without a full-device sync. Created once
+  // (KIND_GPU + ENABLE_CUDA_GRAPH) in the ctor and destroyed in the destructor.
+  cudaEvent_t cuda_graph_input_ready_event_ = nullptr;
+
   // Store the cuda streams created for the 'KIND_MODEL' instance group.
   std::vector<cudaStream_t> stream_vec_;
 
   // The number of available devices.
   int device_cnt_;
+
+#ifdef TRITON_ENABLE_GPU
+  // One captured whole-forward CUDA graph + its fixed I/O buffers and dedicated
+  // capture/replay stream, keyed by input-shape signature. Populated lazily on
+  // the first request of each shape and replayed on subsequent matching
+  // requests. Only used when ModelState::EnabledCudaGraph() is true (which
+  // requires a static-shape .pt2 and a run_single_threaded loader).
+  struct CudaGraphEntry {
+    std::unique_ptr<at::cuda::CUDAGraph> graph;
+    std::vector<torch::Tensor> static_inputs;
+    std::vector<torch::Tensor> static_outputs;
+    c10::cuda::CUDAStream stream;
+  };
+  std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
+
+  // Negative cache: input-shape keys whose capture failed once. We go straight
+  // to eager for these (no re-warmup + re-capture + graph leak on every
+  // subsequent request of the same shape).
+  std::unordered_set<std::string> cuda_graph_failed_;
+
+  // One-time guard (see ExecuteWithCudaGraph): on the first real request,
+  // compare the configured warmup widths vs the actual traffic widths and, on
+  // mismatch, evict the wrong-shape warmup captures so lazy capture
+  // re-populates at the real shape (the cache is keyed only by "R=<bucket>",
+  // not by width).
+  bool warmup_widths_checked_ = false;
+#endif
 
  public:
   virtual ~ModelInstanceState();
@@ -131,14 +170,49 @@ class ModelInstanceState : public BackendModelInstance {
   // the instance group type.
   cudaStream_t GetCudaStreamByInstanceKind();
 
+#ifdef TRITON_ENABLE_GPU
+  // Build a stable key from the input tensor shapes for the CUDA-graph cache.
+  std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
+
+  // Pad the request-batch inputs from R=r up to R=bucket (dummy requests
+  // appended), so the batch can replay the bucket's captured graph. Returns the
+  // padded inputs; caller slices outputs back to r.
+  std::vector<torch::Tensor> PadRequestsUp(
+      const std::vector<torch::Tensor>& inputs, int64_t r,
+      int64_t bucket) const;
+
+  // Capture-on-first-use + replay of the AOTI model for these (static-shape)
+  // inputs on a dedicated stream. Returns false if capture is not possible
+  // (the caller then falls back to eager aoti_model_->run). On success appends
+  // the cloned model outputs to output_tensors.
+  bool ExecuteWithCudaGraph(
+      std::vector<torch::Tensor>* input_tensors,
+      std::vector<torch::Tensor>* output_tensors);
+
+  // Capture the whole-forward AOTI graph for R=<bucket> at the given (already
+  // bucket-shaped) inputs on a dedicated stream and emplace it into
+  // cuda_graph_cache_ (keyed "R=<bucket>"). Returns false on failure: it
+  // negative-caches the bucket in cuda_graph_failed_, restores the stream,
+  // WARNs, and LEAKs the partial at::cuda::CUDAGraph (its dtor must not run).
+  // Used by both load-time warmup and lazy capture.
+  bool CaptureBucket(
+      const std::vector<torch::Tensor>& inputs_at_bucket, int64_t bucket);
+
+  // Load-time warmup: before the instance goes READY, capture every configured
+  // R bucket at zero-valued inputs of the configured warmup widths. No-op
+  // unless ENABLE_CUDA_GRAPH, both warmup widths, and a non-empty bucket set
+  // are all configured. Never throws (a warmup failure is logged; lazy capture
+  // covers it).
+  void WarmupCudaGraphs();
+#endif
+
   // Get the naming convention for inputs/outputs from the model configuration
   TRITONSERVER_Error* GetNamingConvention(
       NamingConvention* naming_convention,
       const std::vector<std::string>& allowed_io);
 
   TRITONSERVER_Error* ReadOutputTensors(
-      size_t total_batch_size,
-      const std::vector<torch::Tensor>& output_tensors,
+      size_t total_batch_size, const std::vector<torch::Tensor>& output_tensors,
       TRITONBACKEND_Request** requests, const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses);
 
