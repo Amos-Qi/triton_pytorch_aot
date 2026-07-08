@@ -34,8 +34,12 @@
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wdangling-reference"
 #pragma warning(push, 0)
+// clang-format off
+// torch/torch.h must be included before the AOTI package header; keep this order
+// (do not let clang-format sort these into an order that breaks the torch build).
 #include <torch/torch.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+// clang-format on
 #pragma warning(pop)
 #pragma GCC diagnostic pop
 
