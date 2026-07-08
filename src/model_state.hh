@@ -69,25 +69,27 @@ class ModelState : public triton::backend::BackendModel {
 
   // Flag to enable whole-forward CUDA-graph capture/replay of the AOTInductor
   // model (ENABLE_CUDA_GRAPH parameter). Requires a static-shape .pt2. When on,
-  // the loader is built run_single_threaded (single runner) so capture is legal.
-  // Defaults to false (unchanged eager-AOTI path).
+  // the loader is built run_single_threaded (single runner) so capture is
+  // legal. Defaults to false (unchanged eager-AOTI path).
   bool enable_cuda_graph_;
 
-  // R (request-batch) buckets to capture whole-forward CUDA graphs for (CUDA_GRAPH_BATCH_SIZES).
-  // A batch is padded UP to the nearest bucket >= its R, replayed, and sliced; R above the max bucket
-  // (or an empty set) falls back to eager. Empty = capture any first-seen shape (unbounded).
+  // R (request-batch) buckets to capture whole-forward CUDA graphs for
+  // (CUDA_GRAPH_BATCH_SIZES). A batch is padded UP to the nearest bucket >= its
+  // R, replayed, and sliced; R above the max bucket (or an empty set) falls
+  // back to eager. Empty = capture any first-seen shape (unbounded).
   std::set<int64_t> cuda_graph_batch_sizes_;
 
-  // Load-time CUDA-graph warmup input widths (0 => warmup disabled). single_width
-  // is packed_single's F1 (column count); multi_width is the per-request
-  // packed_multiple element count (candidate_bucket * F2). Consumed by
-  // ModelInstanceState::WarmupCudaGraphs to build zero inputs before READY.
+  // Load-time CUDA-graph warmup input widths (0 => warmup disabled).
+  // single_width is packed_single's F1 (column count); multi_width is the
+  // per-request packed_multiple element count (candidate_bucket * F2). Consumed
+  // by ModelInstanceState::WarmupCudaGraphs to build zero inputs before READY.
   int64_t cuda_graph_warmup_single_width_;
   int64_t cuda_graph_warmup_multi_width_;
 
   // Prometheus COUNTER families for the CUDA-graph path. Created once by
   // InitCudaGraphMetrics when enable_cuda_graph_ is set; left nullptr (and
-  // silently skipped) if the metrics API is unavailable. Deleted in ~ModelState.
+  // silently skipped) if the metrics API is unavailable. Deleted in
+  // ~ModelState.
   TRITONSERVER_MetricFamily* metric_family_replays_ = nullptr;
   TRITONSERVER_MetricFamily* metric_family_pad_waste_ = nullptr;
   TRITONSERVER_MetricFamily* metric_family_eager_fallbacks_ = nullptr;
@@ -100,7 +102,8 @@ class ModelState : public triton::backend::BackendModel {
   // Emit the "metrics unavailable" warning at most once.
   bool cuda_graph_metrics_warned_ = false;
 
-  // Flag to disable pinned input memory. Defaults to false (pinned input enabled by default).
+  // Flag to disable pinned input memory. Defaults to false (pinned input
+  // enabled by default).
   bool disable_pinned_input_;
 
   // Total instance count from instance_group configuration.
@@ -140,15 +143,27 @@ class ModelState : public triton::backend::BackendModel {
   // Whether whole-forward CUDA-graph capture/replay is enabled for this model.
   bool EnabledCudaGraph();
 
-  // The R buckets to capture CUDA graphs at (empty => capture any first-seen shape).
-  const std::set<int64_t>& CudaGraphBatchSizes() const { return cuda_graph_batch_sizes_; }
+  // The R buckets to capture CUDA graphs at (empty => capture any first-seen
+  // shape).
+  const std::set<int64_t>& CudaGraphBatchSizes() const
+  {
+    return cuda_graph_batch_sizes_;
+  }
 
-  // Load-time warmup input widths (0 => warmup disabled). See the members for units.
-  int64_t CudaGraphWarmupSingleWidth() const { return cuda_graph_warmup_single_width_; }
-  int64_t CudaGraphWarmupMultiWidth() const { return cuda_graph_warmup_multi_width_; }
+  // Load-time warmup input widths (0 => warmup disabled). See the members for
+  // units.
+  int64_t CudaGraphWarmupSingleWidth() const
+  {
+    return cuda_graph_warmup_single_width_;
+  }
+  int64_t CudaGraphWarmupMultiWidth() const
+  {
+    return cuda_graph_warmup_multi_width_;
+  }
 
   // CUDA-graph Prometheus counters. No-ops when metrics are unavailable. Called
-  // from the model-instance CUDA-graph path (ExecuteWithCudaGraph / CaptureBucket).
+  // from the model-instance CUDA-graph path (ExecuteWithCudaGraph /
+  // CaptureBucket).
   void CudaGraphMetricReplay(int64_t bucket);
   void CudaGraphMetricPadWaste(int64_t bucket, int64_t rows);
   void CudaGraphMetricEagerFallback();
@@ -157,8 +172,9 @@ class ModelState : public triton::backend::BackendModel {
   // Check if pinned input is disabled
   bool IsPinnedInputDisabled() const;
 
-  // Custom EnablePinnedInput implementation to respect disable_pinned_input_ flag
-  // Note: This is not an override since BackendModel::EnablePinnedInput() is not virtual
+  // Custom EnablePinnedInput implementation to respect disable_pinned_input_
+  // flag Note: This is not an override since BackendModel::EnablePinnedInput()
+  // is not virtual
   bool EnablePinnedInput() const;
 
   TRITONSERVER_Error* LoadModel(
@@ -179,12 +195,13 @@ class ModelState : public triton::backend::BackendModel {
   // once (best-effort; on failure metrics are left null and silently skipped).
   void InitCudaGraphMetrics();
 
-  // Create a COUNTER metric family; returns nullptr (logging at most once) on failure.
+  // Create a COUNTER metric family; returns nullptr (logging at most once) on
+  // failure.
   TRITONSERVER_MetricFamily* CreateCudaGraphMetricFamily(
       const char* name, const char* description);
 
-  // Get-or-create (and cache) the per-bucket metric handle for a labeled family.
-  // Returns nullptr if the family is null or metric creation fails.
+  // Get-or-create (and cache) the per-bucket metric handle for a labeled
+  // family. Returns nullptr if the family is null or metric creation fails.
   TRITONSERVER_Metric* GetOrCreateBucketMetric(
       TRITONSERVER_MetricFamily* family, int64_t bucket);
 };

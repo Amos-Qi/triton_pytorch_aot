@@ -25,9 +25,10 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "model_state.hh"
-#include "cuda_graph_bucketing.h"
 
 #include <mutex>
+
+#include "cuda_graph_bucketing.h"
 
 
 namespace {
@@ -91,7 +92,8 @@ ModelState::InitCudaGraphMetrics()
       "cudagraph_replays_total", "CUDA-graph replays (per R bucket)");
   metric_family_pad_waste_ = CreateCudaGraphMetricFamily(
       "cudagraph_pad_waste_rows_total",
-      "Padded (dummy) request rows run through CUDA-graph replay (per R bucket)");
+      "Padded (dummy) request rows run through CUDA-graph replay (per R "
+      "bucket)");
   metric_family_eager_fallbacks_ = CreateCudaGraphMetricFamily(
       "cudagraph_eager_fallbacks_total",
       "Requests that fell back to eager AOTInductor instead of a CUDA graph");
@@ -153,7 +155,8 @@ ModelState::GetOrCreateBucketMetric(
       "bucket", TRITONSERVER_PARAMETER_STRING, bucket_str.c_str());
   if (label != nullptr) {
     const TRITONSERVER_Parameter* labels[1] = {label};
-    TRITONSERVER_Error* err = TRITONSERVER_MetricNew(&metric, family, labels, 1);
+    TRITONSERVER_Error* err =
+        TRITONSERVER_MetricNew(&metric, family, labels, 1);
     if (err != nullptr) {
       TRITONSERVER_ErrorDelete(err);
       metric = nullptr;
@@ -311,9 +314,8 @@ ModelState::Create(TRITONBACKEND_Model* triton_model, ModelState** state)
       (*state)->total_instance_count_ = total_count;
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
-          (std::string("Total instance count: ") +
-           std::to_string(total_count) + " for model '" + (*state)->Name() +
-           "'")
+          (std::string("Total instance count: ") + std::to_string(total_count) +
+           " for model '" + (*state)->Name() + "'")
               .c_str());
     }
   }
@@ -428,10 +430,11 @@ ModelState::LoadModel(
     // count to allow concurrent inference from all instances sharing the model.
     size_t num_runners = enable_weight_sharing_ ? total_instance_count_ : 1;
 
-    // CUDA-graph capture requires the loader to run single-threaded (one runner,
-    // no worker-thread stream join) -- otherwise capture fails with "operation
-    // not permitted when stream is capturing" (pytorch/pytorch@85467ed). This
-    // overrides weight sharing's multi-runner setting for the graph path.
+    // CUDA-graph capture requires the loader to run single-threaded (one
+    // runner, no worker-thread stream join) -- otherwise capture fails with
+    // "operation not permitted when stream is capturing"
+    // (pytorch/pytorch@85467ed). This overrides weight sharing's multi-runner
+    // setting for the graph path.
     const bool run_single_threaded = enable_cuda_graph_;
     if (enable_cuda_graph_) {
       num_runners = 1;
@@ -573,8 +576,9 @@ ModelState::ParseParameters()
               .c_str());
     }
 
-    // 'CUDA_GRAPH_BATCH_SIZES' (comma-separated R buckets) -> the allowlist the backend captures graphs
-    // at + pads batches up to. Empty (param absent) => capture any first-seen shape (unbounded).
+    // 'CUDA_GRAPH_BATCH_SIZES' (comma-separated R buckets) -> the allowlist the
+    // backend captures graphs at + pads batches up to. Empty (param absent) =>
+    // capture any first-seen shape (unbounded).
     {
       triton::common::TritonJson::Value cbs;
       if (params.Find("CUDA_GRAPH_BATCH_SIZES", &cbs)) {
@@ -586,7 +590,8 @@ ModelState::ParseParameters()
           cuda_graph_batch_sizes_ = ParseCsvInt64Set(val);
           LOG_MESSAGE(
               TRITONSERVER_LOG_INFO,
-              (std::string("CUDA graph R buckets: '") + val + "' for model instance '" + Name() + "'")
+              (std::string("CUDA graph R buckets: '") + val +
+               "' for model instance '" + Name() + "'")
                   .c_str());
         }
       }
@@ -596,8 +601,8 @@ ModelState::ParseParameters()
     // (run_single_threaded, num_runners=1) loader per instance. Weight sharing
     // would reuse ONE such loader across all instances (LoadModel: reuse
     // ~229-241, register ~286-294), racing their captures/replays -- so force
-    // it off. ParseParameters runs at model init (before any LoadModel), so this
-    // override is effective; LoadModel itself is unchanged.
+    // it off. ParseParameters runs at model init (before any LoadModel), so
+    // this override is effective; LoadModel itself is unchanged.
     if (enable_cuda_graph_ && enable_weight_sharing_) {
       enable_weight_sharing_ = false;
       LOG_MESSAGE(
@@ -611,10 +616,11 @@ ModelState::ParseParameters()
               .c_str());
     }
 
-    // 'CUDA_GRAPH_WARMUP_SINGLE_WIDTH' / 'CUDA_GRAPH_WARMUP_MULTI_WIDTH' (int64):
-    // packed_single's F1 width and the per-request packed_multiple element count
-    // (candidate_bucket * F2). When both > 0 (with a non-empty bucket set) the
-    // instance captures every bucket at load time (see WarmupCudaGraphs). Absent
+    // 'CUDA_GRAPH_WARMUP_SINGLE_WIDTH' / 'CUDA_GRAPH_WARMUP_MULTI_WIDTH'
+    // (int64): packed_single's F1 width and the per-request packed_multiple
+    // element count (candidate_bucket * F2). When both > 0 (with a non-empty
+    // bucket set) the instance captures every bucket at load time (see
+    // WarmupCudaGraphs). Absent
     // => 0 => lazy capture only.
     {
       triton::common::TritonJson::Value w;
@@ -744,8 +750,9 @@ ModelState::ParseParameters()
     }
   }
 
-  // Create the CUDA-graph Prometheus counters once (best-effort). enable_cuda_graph_
-  // is final by this point; the guard makes this a no-op for the non-cudagraph path.
+  // Create the CUDA-graph Prometheus counters once (best-effort).
+  // enable_cuda_graph_ is final by this point; the guard makes this a no-op for
+  // the non-cudagraph path.
   if (enable_cuda_graph_) {
     InitCudaGraphMetrics();
   }

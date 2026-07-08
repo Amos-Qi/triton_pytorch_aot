@@ -31,12 +31,13 @@
 #include <cstdint>
 #include <set>
 
-namespace triton::backend::pytorch {
-namespace {
+namespace triton::backend::pytorch { namespace {
 
 TEST(ParseCsvInt64Set, ParsesSortedUnique)
 {
-  EXPECT_EQ(ParseCsvInt64Set("16,18,20,22,24"), (std::set<int64_t>{16, 18, 20, 22, 24}));
+  EXPECT_EQ(
+      ParseCsvInt64Set("16,18,20,22,24"),
+      (std::set<int64_t>{16, 18, 20, 22, 24}));
 }
 
 TEST(ParseCsvInt64Set, SortsAndDeduplicates)
@@ -74,7 +75,8 @@ TEST(ParseCsvInt64Set, SkipsNonNumericTokens)
 TEST(PadWasteRows, ZeroWhenExactOrRequestExceedsBucket)
 {
   EXPECT_EQ(PadWasteRows(16, 16), 0);
-  EXPECT_EQ(PadWasteRows(20, 16), 0);  // r > bucket must never yield negative waste
+  EXPECT_EQ(
+      PadWasteRows(20, 16), 0);  // r > bucket must never yield negative waste
 }
 
 TEST(PadWasteRows, DifferenceWhenPaddedUp)
@@ -84,5 +86,4 @@ TEST(PadWasteRows, DifferenceWhenPaddedUp)
   EXPECT_EQ(PadWasteRows(15, 16), 1);
 }
 
-}  // namespace
-}  // namespace triton::backend::pytorch
+}}  // namespace triton::backend::pytorch

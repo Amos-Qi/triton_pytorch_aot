@@ -32,14 +32,17 @@
 
 namespace triton::backend::pytorch {
 
-// Pure, dependency-free helpers for the CUDA-graph R-bucketing path. Kept free of CUDA/Triton/torch
-// so they can be unit-tested on any host (see test/cuda_graph_bucketing_test.cc). The backend calls
-// these, so the tested logic is the shipped logic.
+// Pure, dependency-free helpers for the CUDA-graph R-bucketing path. Kept free
+// of CUDA/Triton/torch so they can be unit-tested on any host (see
+// test/cuda_graph_bucketing_test.cc). The backend calls these, so the tested
+// logic is the shipped logic.
 
-// Parse a comma-separated int64 list (e.g. the CUDA_GRAPH_BATCH_SIZES parameter) into a sorted,
-// deduplicated set. Non-numeric or empty tokens are skipped (tolerant parse) and a trailing comma is
-// ignored. Behaviourally identical to the historical inline parse in ModelState::ParseParameters.
-inline std::set<int64_t> ParseCsvInt64Set(const std::string& csv)
+// Parse a comma-separated int64 list (e.g. the CUDA_GRAPH_BATCH_SIZES
+// parameter) into a sorted, deduplicated set. Non-numeric or empty tokens are
+// skipped (tolerant parse) and a trailing comma is ignored. Behaviourally
+// identical to the historical inline parse in ModelState::ParseParameters.
+inline std::set<int64_t>
+ParseCsvInt64Set(const std::string& csv)
 {
   std::set<int64_t> out;
   size_t start = 0;
@@ -60,9 +63,10 @@ inline std::set<int64_t> ParseCsvInt64Set(const std::string& csv)
   return out;
 }
 
-// Number of padded (dummy) request rows added when a batch of size `r` replays the graph captured for
-// R=`bucket` (bucket >= r). Zero when the batch already equals the bucket or exceeds it. Used for the
-// cudagraph_pad_waste_rows_total metric.
+// Number of padded (dummy) request rows added when a batch of size `r` replays
+// the graph captured for R=`bucket` (bucket >= r). Zero when the batch already
+// equals the bucket or exceeds it. Used for the cudagraph_pad_waste_rows_total
+// metric.
 inline int64_t
 PadWasteRows(int64_t r, int64_t bucket)
 {

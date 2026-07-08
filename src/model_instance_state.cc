@@ -26,14 +26,14 @@
 
 #include "model_instance_state.hh"
 
-#include "cuda_graph_bucketing.h"
-#include "string_utils.hh"
-
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
-#include <atomic>
 #include <vector>
+
+#include "cuda_graph_bucketing.h"
+#include "string_utils.hh"
 
 #ifdef TRITON_PYTORCH_ENABLE_TORCHVISION
 // Suppress warnings in torch headers
@@ -65,9 +65,9 @@ ModelInstanceState::ModelInstanceState(
     device_ = torch::Device(torch::kCUDA, DeviceId());
     CreateCudaEvents(DeviceId());
     if (model_state->EnabledCudaGraph()) {
-      // Persistent, timing-disabled event to order the graph-replay stream behind
-      // the input-collection stream in ExecuteWithCudaGraph (the device was already
-      // set by CreateCudaEvents above).
+      // Persistent, timing-disabled event to order the graph-replay stream
+      // behind the input-collection stream in ExecuteWithCudaGraph (the device
+      // was already set by CreateCudaEvents above).
       THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
           cudaEventCreateWithFlags(
               &cuda_graph_input_ready_event_, cudaEventDisableTiming),
@@ -253,7 +253,8 @@ ModelInstanceState::Create(
 #ifdef TRITON_ENABLE_GPU
   // Capture the configured CUDA-graph buckets before the instance goes READY
   // (no-op unless ENABLE_CUDA_GRAPH + warmup widths + a bucket set are all
-  // configured). WarmupCudaGraphs never throws -- lazy capture is the safety net.
+  // configured). WarmupCudaGraphs never throws -- lazy capture is the safety
+  // net.
   (*state)->WarmupCudaGraphs();
 #endif
 
@@ -300,8 +301,8 @@ ModelInstanceState::Execute(
 
 #ifdef TRITON_ENABLE_GPU
     // Whole-forward CUDA-graph path (opt-in via ENABLE_CUDA_GRAPH, GPU only):
-    // capture-on-first-use + replay for a fixed input shape. Falls through to the
-    // eager run below if capture is not possible for these inputs.
+    // capture-on-first-use + replay for a fixed input shape. Falls through to
+    // the eager run below if capture is not possible for these inputs.
     if (model_state_->EnabledCudaGraph() && !device_.is_cpu()) {
       if (ExecuteWithCudaGraph(input_tensors, output_tensors)) {
         return;
@@ -318,7 +319,8 @@ ModelInstanceState::Execute(
 
 #ifdef TRITON_ENABLE_GPU
     // Synchronize the stream to wait for kernels to complete
-    // This is necessary because aoti_model_->run() launches kernels asynchronously
+    // This is necessary because aoti_model_->run() launches kernels
+    // asynchronously
     if (!device_.is_cpu()) {
       cudaStreamSynchronize(GetCudaStreamByInstanceKind());
     }
@@ -394,25 +396,32 @@ std::vector<torch::Tensor>
 ModelInstanceState::PadRequestsUp(
     const std::vector<torch::Tensor>& inputs, int64_t r, int64_t bucket) const
 {
-  // v3_q3a request-batch layout: [0] packed_single (R, F1), [1] packed_multiple flat (R*per,),
-  // [2] request_end_position (R,) = cumsum of per-request element counts. Pad R -> bucket by appending
-  // zero rows to the packed tensors (dummy requests are inert -- candidate queries attend only to their
-  // own request's user-history KV, never across requests; their output rows are sliced off), and
-  // regenerate the cumsum (a zero-padded cumsum would be wrong).
+  // v3_q3a request-batch layout: [0] packed_single (R, F1), [1] packed_multiple
+  // flat (R*per,), [2] request_end_position (R,) = cumsum of per-request
+  // element counts. Pad R -> bucket by appending zero rows to the packed
+  // tensors (dummy requests are inert -- candidate queries attend only to their
+  // own request's user-history KV, never across requests; their output rows are
+  // sliced off), and regenerate the cumsum (a zero-padded cumsum would be
+  // wrong).
   std::vector<torch::Tensor> out;
   out.reserve(inputs.size());
-  const int64_t per = inputs[1].numel() / r;  // elements/request (uniform: candidates padded to bucket)
+  const int64_t per =
+      inputs[1].numel() /
+      r;  // elements/request (uniform: candidates padded to bucket)
   for (size_t i = 0; i < inputs.size(); ++i) {
     const torch::Tensor& t = inputs[i];
     if (i == 2) {
-      auto rep = torch::arange(
-                     1, bucket + 1,
-                     torch::TensorOptions().dtype(torch::kLong).device(t.device())) *
-                 per;
+      auto rep =
+          torch::arange(
+              1, bucket + 1,
+              torch::TensorOptions().dtype(torch::kLong).device(t.device())) *
+          per;
       out.push_back(rep.to(t.scalar_type()));
     } else {
       auto sizes = t.sizes().vec();
-      sizes[0] = sizes[0] / r * bucket;  // scale leading dim R->bucket (packed_single; flat multiple)
+      sizes[0] =
+          sizes[0] / r *
+          bucket;  // scale leading dim R->bucket (packed_single; flat multiple)
       auto padded = torch::zeros(sizes, t.options());
       padded.narrow(0, 0, t.size(0)).copy_(t);
       out.push_back(padded);
@@ -432,14 +441,14 @@ ModelInstanceState::CaptureBucket(
       c10::cuda::getCurrentCUDAStream(device_.index());
 
   // Raw pointer so a FAILED capture can LEAK the graph: after a failed capture
-  // at::cuda::CUDAGraph's destructor can throw a second error -> std::terminate,
-  // so we must not let it run. A capture failure is a rare safety-net path (the
-  // intended static shape captures cleanly).
+  // at::cuda::CUDAGraph's destructor can throw a second error ->
+  // std::terminate, so we must not let it run. A capture failure is a rare
+  // safety-net path (the intended static shape captures cleanly).
   at::cuda::CUDAGraph* graph = nullptr;
   try {
-    // Low-level CUDA runner: run_with_cuda_stream runs AOTI on the capture stream
-    // (the pattern proven by the route-c de-risk spike). Requires the loader to
-    // have been built run_single_threaded (ENABLE_CUDA_GRAPH).
+    // Low-level CUDA runner: run_with_cuda_stream runs AOTI on the capture
+    // stream (the pattern proven by the route-c de-risk spike). Requires the
+    // loader to have been built run_single_threaded (ENABLE_CUDA_GRAPH).
     auto* runner = static_cast<torch::inductor::AOTIModelContainerRunnerCuda*>(
         aoti_model_->get_runner());
     if (runner == nullptr) {
@@ -452,7 +461,8 @@ ModelInstanceState::CaptureBucket(
         c10::cuda::getStreamFromPool(/*isHighPriority=*/false, device_.index());
     c10::cuda::setCurrentCUDAStream(stream);
 
-    // Fixed-address input buffers (the graph replays into the same addresses), at the bucket shape.
+    // Fixed-address input buffers (the graph replays into the same addresses),
+    // at the bucket shape.
     std::vector<torch::Tensor> static_inputs;
     static_inputs.reserve(inputs_at_bucket.size());
     for (const auto& t : inputs_at_bucket) {
@@ -488,8 +498,8 @@ ModelInstanceState::CaptureBucket(
     return true;
   }
   catch (const std::exception& ex) {
-    // Best-effort: pull the caching allocator out of capture mode, then LEAK the
-    // graph (don't delete -> its dtor never runs). Fall back to eager.
+    // Best-effort: pull the caching allocator out of capture mode, then LEAK
+    // the graph (don't delete -> its dtor never runs). Fall back to eager.
     if (graph != nullptr) {
       try {
         graph->capture_end();
@@ -514,23 +524,24 @@ ModelInstanceState::ExecuteWithCudaGraph(
     std::vector<torch::Tensor>* input_tensors,
     std::vector<torch::Tensor>* output_tensors)
 {
-  // Only the v3_q3a 3-input request-batch layout is R-bucketed; any other layout -> eager.
+  // Only the v3_q3a 3-input request-batch layout is R-bucketed; any other
+  // layout -> eager.
   if (input_tensors->size() != 3) {
     model_state_->CudaGraphMetricEagerFallback();
     return false;
   }
-  // Request count R = smallest leading dim (packed_single & request_end_position are (R,...);
-  // packed_multiple is (R*per,), larger).
+  // Request count R = smallest leading dim (packed_single &
+  // request_end_position are (R,...); packed_multiple is (R*per,), larger).
   int64_t r = (*input_tensors)[0].size(0);
   for (const auto& t : *input_tensors) {
     r = std::min<int64_t>(r, t.size(0));
   }
 
   // One-time width self-heal: warmup captured graphs at the configured widths
-  // (CUDA_GRAPH_WARMUP_*_WIDTH). The cache is keyed only by "R=<bucket>", so if the
-  // real traffic width differs, a wrong-shape warmup entry would be replayed and
-  // copy_ would shape-mismatch every request -- evict all warmup captures here so
-  // lazy capture re-populates at the real shape.
+  // (CUDA_GRAPH_WARMUP_*_WIDTH). The cache is keyed only by "R=<bucket>", so if
+  // the real traffic width differs, a wrong-shape warmup entry would be
+  // replayed and copy_ would shape-mismatch every request -- evict all warmup
+  // captures here so lazy capture re-populates at the real shape.
   if (!warmup_widths_checked_) {
     warmup_widths_checked_ = true;
     const int64_t cfg_single = model_state_->CudaGraphWarmupSingleWidth();
@@ -544,11 +555,11 @@ ModelInstanceState::ExecuteWithCudaGraph(
             TRITONSERVER_LOG_WARN,
             (std::string(
                  "CUDA-graph warmup WIDTH MISMATCH on model instance '") +
-             Name() + "': configured single_width=" +
-             std::to_string(cfg_single) + " multi_width=" +
-             std::to_string(cfg_multi) + " but actual traffic single_width=" +
-             std::to_string(real_single) + " multi_width=" +
-             std::to_string(real_multi) +
+             Name() +
+             "': configured single_width=" + std::to_string(cfg_single) +
+             " multi_width=" + std::to_string(cfg_multi) +
+             " but actual traffic single_width=" + std::to_string(real_single) +
+             " multi_width=" + std::to_string(real_multi) +
              "; evicting warmup captures and re-capturing lazily at the real "
              "shape")
                 .c_str());
@@ -560,11 +571,11 @@ ModelInstanceState::ExecuteWithCudaGraph(
 
   const auto& buckets = model_state_->CudaGraphBatchSizes();
 
-  // Select an R bucket we can replay at. For the allowlist, advance ascending from
-  // lower_bound(r), skipping buckets whose capture failed; capture-on-first-use
-  // and, if that capture fails, advance to the next healthy bucket. Bounded by the
-  // bucket-set size (no retry storm). Empty allowlist keeps the "capture the exact
-  // first-seen shape" behavior.
+  // Select an R bucket we can replay at. For the allowlist, advance ascending
+  // from lower_bound(r), skipping buckets whose capture failed;
+  // capture-on-first-use and, if that capture fails, advance to the next
+  // healthy bucket. Bounded by the bucket-set size (no retry storm). Empty
+  // allowlist keeps the "capture the exact first-seen shape" behavior.
   std::vector<torch::Tensor> padded_storage;
   const std::vector<torch::Tensor>* inputs_at_bucket = nullptr;
   int64_t bucket = -1;
@@ -598,7 +609,8 @@ ModelInstanceState::ExecuteWithCudaGraph(
       if (cuda_graph_failed_.find(cand_key) != cuda_graph_failed_.end()) {
         continue;
       }
-      // Pad R up to this candidate bucket (no-op if the batch already equals it).
+      // Pad R up to this candidate bucket (no-op if the batch already equals
+      // it).
       std::vector<torch::Tensor> cand_padded;
       const std::vector<torch::Tensor>* cand_inputs = input_tensors;
       if (cand != r) {
@@ -622,7 +634,8 @@ ModelInstanceState::ExecuteWithCudaGraph(
       break;
     }
     if (!ready) {
-      // R above the largest bucket, or every candidate bucket failed capture -> eager.
+      // R above the largest bucket, or every candidate bucket failed capture ->
+      // eager.
       model_state_->CudaGraphMetricEagerFallback();
       return false;
     }
@@ -635,9 +648,10 @@ ModelInstanceState::ExecuteWithCudaGraph(
     CudaGraphEntry& e = it->second;
     c10::cuda::setCurrentCUDAStream(e.stream);
     // The input tensors were produced on the instance stream (SetInputTensors);
-    // make the graph stream wait on that producer before we copy_ (risk #9) via a
-    // lightweight event instead of a full-device sync so other streams aren't
-    // stalled. The post-replay e.stream.synchronize() below still gates outputs.
+    // make the graph stream wait on that producer before we copy_ (risk #9) via
+    // a lightweight event instead of a full-device sync so other streams aren't
+    // stalled. The post-replay e.stream.synchronize() below still gates
+    // outputs.
     cudaEventRecord(
         cuda_graph_input_ready_event_, GetCudaStreamByInstanceKind());
     cudaStreamWaitEvent(e.stream.stream(), cuda_graph_input_ready_event_, 0);
@@ -647,9 +661,9 @@ ModelInstanceState::ExecuteWithCudaGraph(
     e.graph->replay();
     e.stream.synchronize();
 
-    // Slice each output's batch dim (dim 0 = R) back to the real request count -- the padded (dummy)
-    // request rows are discarded. clone so the next replay + the Triton responder don't race on the
-    // static output buffers.
+    // Slice each output's batch dim (dim 0 = R) back to the real request count
+    // -- the padded (dummy) request rows are discarded. clone so the next
+    // replay + the Triton responder don't race on the static output buffers.
     for (const auto& o : e.static_outputs) {
       output_tensors->push_back((r == bucket ? o : o.narrow(0, 0, r)).clone());
     }
@@ -676,11 +690,12 @@ ModelInstanceState::ExecuteWithCudaGraph(
 void
 ModelInstanceState::WarmupCudaGraphs()
 {
-  // Load-time warmup: capture every configured R bucket now (before the instance
-  // goes READY) so the first live request of each bucket replays instead of paying
-  // the ~150 ms capture cost inline. Zero-valued inputs are safe -- capture depends
-  // on shapes, not values. Lazy capture in ExecuteWithCudaGraph is the safety net
-  // for any bucket skipped or failed here.
+  // Load-time warmup: capture every configured R bucket now (before the
+  // instance goes READY) so the first live request of each bucket replays
+  // instead of paying the ~150 ms capture cost inline. Zero-valued inputs are
+  // safe -- capture depends on shapes, not values. Lazy capture in
+  // ExecuteWithCudaGraph is the safety net for any bucket skipped or failed
+  // here.
   if (!(model_state_->EnabledCudaGraph() && !device_.is_cpu() &&
         model_state_->CudaGraphWarmupSingleWidth() > 0 &&
         model_state_->CudaGraphWarmupMultiWidth() > 0 &&
@@ -692,22 +707,24 @@ ModelInstanceState::WarmupCudaGraphs()
   const int64_t multi_width = model_state_->CudaGraphWarmupMultiWidth();
   const auto& buckets = model_state_->CudaGraphBatchSizes();
 
-  // NOTE: warmup adds ~(num_buckets x ~150 ms) to this instance's load/READY time.
+  // NOTE: warmup adds ~(num_buckets x ~150 ms) to this instance's load/READY
+  // time.
   LOG_MESSAGE(
       TRITONSERVER_LOG_INFO,
       (std::string("CUDA-graph warmup: capturing ") +
-       std::to_string(buckets.size()) + " bucket(s) at single_width=" +
-       std::to_string(single_width) + " multi_width=" +
-       std::to_string(multi_width) + " for model instance '" + Name() +
-       "' (expect ~" + std::to_string(buckets.size() * 150) +
+       std::to_string(buckets.size()) +
+       " bucket(s) at single_width=" + std::to_string(single_width) +
+       " multi_width=" + std::to_string(multi_width) + " for model instance '" +
+       Name() + "' (expect ~" + std::to_string(buckets.size() * 150) +
        " ms added to READY time)")
           .c_str());
 
   for (const int64_t bucket : buckets) {  // std::set iterates ascending
     try {
       // v3_q3a request-batch layout at the bucket shape (see PadRequestsUp):
-      // [0] packed_single (bucket, F1), [1] packed_multiple flat (bucket*multi,),
-      // [2] request_end_position (bucket,) = cumsum of per-request element counts.
+      // [0] packed_single (bucket, F1), [1] packed_multiple flat
+      // (bucket*multi,), [2] request_end_position (bucket,) = cumsum of
+      // per-request element counts.
       auto single = torch::zeros(
           {bucket, single_width},
           torch::dtype(torch::kFloat64).device(device_));
@@ -733,7 +750,8 @@ ModelInstanceState::WarmupCudaGraphs()
               .c_str());
     }
     catch (const std::exception& ex) {
-      // Never abort instance creation on a warmup failure -- lazy capture covers it.
+      // Never abort instance creation on a warmup failure -- lazy capture
+      // covers it.
       LOG_MESSAGE(
           TRITONSERVER_LOG_WARN,
           (std::string("CUDA-graph warmup bucket R=") + std::to_string(bucket) +
@@ -1010,7 +1028,6 @@ ModelInstanceState::ProcessRequests(
         SetInputTensors(
             total_batch_size, requests, request_count, &responses,
             collector.get(), &input_names, &input_tensors, &cuda_copy));
-    
   }
 
 #ifdef TRITON_ENABLE_GPU
@@ -1160,7 +1177,6 @@ ModelInstanceState::ProcessRequests(
             compute_start_ns, compute_end_ns, exec_end_ns),
         "failed reporting batch request statistics");
   }
-
 }
 
 TRITONSERVER_Error*
@@ -1178,7 +1194,7 @@ ModelInstanceState::ReadOutputTensors(
       GetCudaStreamByInstanceKind());
 
   bool cuda_copy = false;
-  
+
   for (auto& output : model_state_->ModelOutputs()) {
     int op_index = output_index_map_[output.first];
     auto name = output.first;
@@ -1190,10 +1206,9 @@ ModelInstanceState::ReadOutputTensors(
     }
     catch (std::exception& ex) {
       RETURN_IF_ERROR(TRITONSERVER_ErrorNew(
-          TRITONSERVER_ERROR_INTERNAL,
-          (std::string("output tensor '") + name + "' is not found: " +
-           ex.what())
-              .c_str()));
+          TRITONSERVER_ERROR_INTERNAL, (std::string("output tensor '") + name +
+                                        "' is not found: " + ex.what())
+                                           .c_str()));
     }
 
     // Verify output datatype matches datatype from model config
@@ -1220,7 +1235,7 @@ ModelInstanceState::ReadOutputTensors(
                                  : TRITONSERVER_MEMORY_GPU;
     const auto memory_id =
         (tensor_device.type() == torch::kCPU) ? 0 : tensor_device.index();
-    
+
     // Batch output doesn't support string data type yet, as it is not trivial
     // to parse string output
     const BatchOutput* batch_output = StateForModel()->FindBatchOutput(name);
@@ -1249,7 +1264,7 @@ ModelInstanceState::ReadOutputTensors(
         states = responder.ProcessStateTensor(
             name, output_dtype, batchn_shape, output_buffer, memory_type,
             memory_id);
-        
+
         // Update the states
         for (auto& state : states) {
           RETURN_IF_ERROR(TRITONBACKEND_StateUpdate(state));

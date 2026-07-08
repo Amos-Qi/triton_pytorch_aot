@@ -114,14 +114,16 @@ class ModelInstanceState : public BackendModelInstance {
   };
   std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
 
-  // Negative cache: input-shape keys whose capture failed once. We go straight to eager for these
-  // (no re-warmup + re-capture + graph leak on every subsequent request of the same shape).
+  // Negative cache: input-shape keys whose capture failed once. We go straight
+  // to eager for these (no re-warmup + re-capture + graph leak on every
+  // subsequent request of the same shape).
   std::unordered_set<std::string> cuda_graph_failed_;
 
-  // One-time guard (see ExecuteWithCudaGraph): on the first real request, compare
-  // the configured warmup widths vs the actual traffic widths and, on mismatch,
-  // evict the wrong-shape warmup captures so lazy capture re-populates at the real
-  // shape (the cache is keyed only by "R=<bucket>", not by width).
+  // One-time guard (see ExecuteWithCudaGraph): on the first real request,
+  // compare the configured warmup widths vs the actual traffic widths and, on
+  // mismatch, evict the wrong-shape warmup captures so lazy capture
+  // re-populates at the real shape (the cache is keyed only by "R=<bucket>",
+  // not by width).
   bool warmup_widths_checked_ = false;
 #endif
 
@@ -172,10 +174,12 @@ class ModelInstanceState : public BackendModelInstance {
   // Build a stable key from the input tensor shapes for the CUDA-graph cache.
   std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
 
-  // Pad the request-batch inputs from R=r up to R=bucket (dummy requests appended), so the batch can
-  // replay the bucket's captured graph. Returns the padded inputs; caller slices outputs back to r.
+  // Pad the request-batch inputs from R=r up to R=bucket (dummy requests
+  // appended), so the batch can replay the bucket's captured graph. Returns the
+  // padded inputs; caller slices outputs back to r.
   std::vector<torch::Tensor> PadRequestsUp(
-      const std::vector<torch::Tensor>& inputs, int64_t r, int64_t bucket) const;
+      const std::vector<torch::Tensor>& inputs, int64_t r,
+      int64_t bucket) const;
 
   // Capture-on-first-use + replay of the AOTI model for these (static-shape)
   // inputs on a dedicated stream. Returns false if capture is not possible
@@ -188,16 +192,17 @@ class ModelInstanceState : public BackendModelInstance {
   // Capture the whole-forward AOTI graph for R=<bucket> at the given (already
   // bucket-shaped) inputs on a dedicated stream and emplace it into
   // cuda_graph_cache_ (keyed "R=<bucket>"). Returns false on failure: it
-  // negative-caches the bucket in cuda_graph_failed_, restores the stream, WARNs,
-  // and LEAKs the partial at::cuda::CUDAGraph (its dtor must not run). Used by both
-  // load-time warmup and lazy capture.
+  // negative-caches the bucket in cuda_graph_failed_, restores the stream,
+  // WARNs, and LEAKs the partial at::cuda::CUDAGraph (its dtor must not run).
+  // Used by both load-time warmup and lazy capture.
   bool CaptureBucket(
       const std::vector<torch::Tensor>& inputs_at_bucket, int64_t bucket);
 
-  // Load-time warmup: before the instance goes READY, capture every configured R
-  // bucket at zero-valued inputs of the configured warmup widths. No-op unless
-  // ENABLE_CUDA_GRAPH, both warmup widths, and a non-empty bucket set are all
-  // configured. Never throws (a warmup failure is logged; lazy capture covers it).
+  // Load-time warmup: before the instance goes READY, capture every configured
+  // R bucket at zero-valued inputs of the configured warmup widths. No-op
+  // unless ENABLE_CUDA_GRAPH, both warmup widths, and a non-empty bucket set
+  // are all configured. Never throws (a warmup failure is logged; lazy capture
+  // covers it).
   void WarmupCudaGraphs();
 #endif
 
@@ -207,8 +212,7 @@ class ModelInstanceState : public BackendModelInstance {
       const std::vector<std::string>& allowed_io);
 
   TRITONSERVER_Error* ReadOutputTensors(
-      size_t total_batch_size,
-      const std::vector<torch::Tensor>& output_tensors,
+      size_t total_batch_size, const std::vector<torch::Tensor>& output_tensors,
       TRITONBACKEND_Request** requests, const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses);
 
