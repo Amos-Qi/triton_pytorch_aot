@@ -1601,9 +1601,11 @@ ModelInstanceState::SetInputTensors(
           prestaged_entry_->static_inputs[input_index_map_[info.name]];
       const size_t batchn_byte_size = static_cast<size_t>(
           info.batchn_elements * st.element_size());
-      RETURN_IF_ERROR(collector->ProcessTensor(
+      // This ProcessTensor overload returns void; per-request failures are
+      // reported through `responses` internally.
+      collector->ProcessTensor(
           info.name, static_cast<char*>(st.data_ptr()), batchn_byte_size,
-          TRITONSERVER_MEMORY_GPU, device_.index()));
+          TRITONSERVER_MEMORY_GPU, device_.index());
       const int64_t prefix_dim0 = r * (st.size(0) / prestaged_bucket_);
       if (prefix_dim0 < st.size(0)) {
         // Zero the padded tail (also clears stale rows from a previous,
