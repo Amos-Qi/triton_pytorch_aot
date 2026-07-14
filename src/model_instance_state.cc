@@ -565,8 +565,27 @@ ModelInstanceState::ExecuteWithCudaGraph(
                 .c_str());
         cuda_graph_cache_.clear();
         cuda_graph_failed_.clear();
+        // Defensive: a prestaged pointer would dangle after clear(). It cannot
+        // actually be set here (prestaging requires the batch widths to MATCH
+        // the captured buffers, and this branch fires only on width mismatch),
+        // but null it anyway; the narrowed input views keep their storage
+        // alive via refcounting, so the slow path below still works.
+        prestaged_entry_ = nullptr;
+        prestaged_bucket_ = -1;
       }
     }
+  }
+
+  // Fast path: SetInputTensors already collected this batch DIRECTLY into an
+  // existing bucket entry's static input buffers (and zeroed the padded tail),
+  // so skip selection + PadRequestsUp + the static copy_ pass and replay.
+  if (prestaged_entry_ != nullptr) {
+    CudaGraphEntry& e = *prestaged_entry_;
+    const int64_t bucket = prestaged_bucket_;
+    prestaged_entry_ = nullptr;
+    prestaged_bucket_ = -1;
+    return ReplayCudaGraphEntry(
+        e, r, bucket, /*copy_from=*/nullptr, output_tensors);
   }
 
   const auto& buckets = model_state_->CudaGraphBatchSizes();
@@ -642,21 +661,33 @@ ModelInstanceState::ExecuteWithCudaGraph(
   }
 
   // ---- Replay (also runs the just-captured graph on first use) ----
+  return ReplayCudaGraphEntry(
+      it->second, r, bucket, inputs_at_bucket, output_tensors);
+}
+
+bool
+ModelInstanceState::ReplayCudaGraphEntry(
+    CudaGraphEntry& e, int64_t r, int64_t bucket,
+    const std::vector<torch::Tensor>* copy_from,
+    std::vector<torch::Tensor>* output_tensors)
+{
   const c10::cuda::CUDAStream prev_stream =
       c10::cuda::getCurrentCUDAStream(device_.index());
   try {
-    CudaGraphEntry& e = it->second;
     c10::cuda::setCurrentCUDAStream(e.stream);
     // The input tensors were produced on the instance stream (SetInputTensors);
-    // make the graph stream wait on that producer before we copy_ (risk #9) via
-    // a lightweight event instead of a full-device sync so other streams aren't
-    // stalled. The post-replay e.stream.synchronize() below still gates
-    // outputs.
+    // make the graph stream wait on that producer before we touch the static
+    // buffers (risk #9) via a lightweight event instead of a full-device sync
+    // so other streams aren't stalled. The post-replay e.stream.synchronize()
+    // below still gates outputs. The event also orders PRESTAGED writes (direct
+    // collector H2D + tail zeroing, both on the instance stream).
     cudaEventRecord(
         cuda_graph_input_ready_event_, GetCudaStreamByInstanceKind());
     cudaStreamWaitEvent(e.stream.stream(), cuda_graph_input_ready_event_, 0);
-    for (size_t i = 0; i < inputs_at_bucket->size(); ++i) {
-      e.static_inputs[i].copy_((*inputs_at_bucket)[i]);
+    if (copy_from != nullptr) {
+      for (size_t i = 0; i < copy_from->size(); ++i) {
+        e.static_inputs[i].copy_((*copy_from)[i]);
+      }
     }
     e.graph->replay();
     e.stream.synchronize();
@@ -681,10 +712,43 @@ ModelInstanceState::ExecuteWithCudaGraph(
     LOG_MESSAGE(
         TRITONSERVER_LOG_WARN,
         (std::string("CUDA-graph replay failed (") + ex.what() +
-         "); falling back to eager for shape '" + key + "'")
+         "); falling back to eager for bucket R=" + std::to_string(bucket))
             .c_str());
     return false;
   }
+}
+
+ModelInstanceState::CudaGraphEntry*
+ModelInstanceState::FindReadyCudaGraphEntry(int64_t r, int64_t* bucket_out)
+{
+  if (!model_state_->EnabledCudaGraph() || device_.is_cpu()) {
+    return nullptr;
+  }
+  const auto& buckets = model_state_->CudaGraphBatchSizes();
+  if (buckets.empty()) {
+    // Exact-shape mode: only a previously captured R=r entry qualifies.
+    auto it = cuda_graph_cache_.find("R=" + std::to_string(r));
+    if (it == cuda_graph_cache_.end()) {
+      return nullptr;
+    }
+    *bucket_out = r;
+    return &it->second;
+  }
+  for (auto b_it = buckets.lower_bound(r); b_it != buckets.end(); ++b_it) {
+    const std::string key = "R=" + std::to_string(*b_it);
+    if (cuda_graph_failed_.find(key) != cuda_graph_failed_.end()) {
+      continue;
+    }
+    auto it = cuda_graph_cache_.find(key);
+    if (it == cuda_graph_cache_.end()) {
+      // The slow path would capture-on-first-use at THIS bucket; defer to it
+      // so prestaging never diverges from the canonical bucket selection.
+      return nullptr;
+    }
+    *bucket_out = *b_it;
+    return &it->second;
+  }
+  return nullptr;
 }
 
 void
@@ -1016,6 +1080,21 @@ ModelInstanceState::ProcessRequests(
             TRITONSERVER_ERROR_INTERNAL, "Failed to record the event."));
 #endif
   }
+
+#ifdef TRITON_ENABLE_GPU
+  // Input prestaging: when the bucket this batch would replay at is already
+  // captured, SetInputTensors collects the payloads directly into its static
+  // input buffers, and ExecuteWithCudaGraph skips PadRequestsUp + the
+  // replay-time copy_ pass. Viability (widths/dtypes/uniformity) is
+  // re-checked in SetInputTensors before any payload is consumed.
+  prestaged_entry_ = nullptr;
+  prestaged_bucket_ = -1;
+  if (!all_response_failed && model_state_->EnabledCudaGraph() &&
+      !device_.is_cpu()) {
+    prestaged_entry_ = FindReadyCudaGraphEntry(
+        static_cast<int64_t>(total_batch_size), &prestaged_bucket_);
+  }
+#endif
 
   if (!all_response_failed) {
     collector.reset(new BackendInputCollector(
@@ -1361,6 +1440,19 @@ ModelInstanceState::SetInputTensors(
     alloc_perference = {{TRITONSERVER_MEMORY_GPU, device_.index()}};
   }
 
+  // Pass 1: gather every declared input's name/dtype/batched shape WITHOUT
+  // collecting (request payloads are consumable, so the prestage decision must
+  // precede the first ProcessTensor call). For ragged inputs also track
+  // whether every request contributes the same element count -- the prestaged
+  // static buffers assume uniform per-request slots.
+  struct DeclaredInput {
+    const char* name = nullptr;
+    TRITONSERVER_DataType datatype = TRITONSERVER_TYPE_INVALID;
+    std::vector<int64_t> batchn_shape;
+    int64_t batchn_elements = 0;
+    bool ragged_uniform = true;
+  };
+  std::vector<DeclaredInput> declared(input_count);
   for (uint32_t input_idx = 0; input_idx < input_count; input_idx++) {
     TRITONBACKEND_Input* input;
     RETURN_IF_ERROR(
@@ -1375,13 +1467,26 @@ ModelInstanceState::SetInputTensors(
         nullptr, nullptr));
 
     input_names->emplace_back(input_name);
+    DeclaredInput& info = declared[input_idx];
+    info.name = input_name;
+    info.datatype = input_datatype;
+
+    // AOTInductor does not support string inputs
+    if (input_datatype == TRITONSERVER_TYPE_BYTES) {
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INVALID_ARG,
+          (std::string("AOTInductor models do not support string/bytes input "
+                       "type for input '") +
+           input_name + "'")
+              .c_str());
+    }
 
     // The shape for the entire input patch,
     // [total_batch_size, ...] for non-ragged input and
     // [total_element_count] for ragged input (non-nested tensor)
-    std::vector<int64_t> batchn_shape;
     if (StateForModel()->IsInputRagged(input_name)) {
-      batchn_shape = std::vector<int64_t>{0};
+      info.batchn_shape = std::vector<int64_t>{0};
+      int64_t first_element_cnt = -1;
       for (size_t idx = 0; idx < request_count; idx++) {
         TRITONBACKEND_Input* input;
         RESPOND_AND_SET_NULL_IF_ERROR(
@@ -1398,15 +1503,125 @@ ModelInstanceState::SetInputTensors(
         RESPOND_AND_SET_NULL_IF_ERROR(
             &((*responses)[idx]),
             GetElementCount(input_shape, input_dims_count, &element_cnt));
-        batchn_shape[0] += element_cnt;
+        if (first_element_cnt < 0) {
+          first_element_cnt = element_cnt;
+        } else if (element_cnt != first_element_cnt) {
+          info.ragged_uniform = false;
+        }
+        info.batchn_shape[0] += element_cnt;
       }
     } else {
-      batchn_shape =
+      info.batchn_shape =
           std::vector<int64_t>(input_shape, input_shape + input_dims_count);
       if (supports_batching_) {
-        batchn_shape[0] = total_batch_size;
+        info.batchn_shape[0] = total_batch_size;
       }
     }
+    int64_t elements = 0;
+    RETURN_IF_ERROR(GetElementCount(
+        info.batchn_shape.data(),
+        static_cast<uint32_t>(info.batchn_shape.size()), &elements));
+    info.batchn_elements = elements;
+  }
+
+#ifdef TRITON_ENABLE_GPU
+  // Input prestaging viability: every declared input must line up with the
+  // resolved bucket entry's static buffer (dtype, per-request-slot width,
+  // nonzero size, uniform ragged widths). Decided BEFORE any collection so the
+  // batch is never split between paths; any mismatch falls back wholesale.
+  if (prestaged_entry_ != nullptr) {
+    const int64_t r = static_cast<int64_t>(total_batch_size);
+    bool viable =
+        (!device_.is_cpu()) && (r > 0) &&
+        (Kind() != TRITONSERVER_INSTANCEGROUPKIND_MODEL) &&
+        (prestaged_bucket_ >= r) &&
+        (prestaged_entry_->static_inputs.size() ==
+         static_cast<size_t>(input_count) + batch_input_count_);
+    for (uint32_t i = 0; viable && (i < input_count); ++i) {
+      const DeclaredInput& info = declared[i];
+      const auto idx_it = input_index_map_.find(info.name);
+      if (idx_it == input_index_map_.end() ||
+          static_cast<size_t>(idx_it->second) >=
+              prestaged_entry_->static_inputs.size()) {
+        viable = false;
+        break;
+      }
+      const torch::Tensor& st = prestaged_entry_->static_inputs[idx_it->second];
+      const auto torch_dtype = ConvertDataTypeToTorchType(info.datatype);
+      viable = st.is_cuda() && st.is_contiguous() &&
+               (st.scalar_type() == torch_dtype.second) &&
+               (st.numel() % prestaged_bucket_ == 0) &&
+               (st.size(0) % prestaged_bucket_ == 0) &&
+               (info.batchn_elements ==
+                r * (st.numel() / prestaged_bucket_)) &&
+               (info.batchn_elements > 0) && info.ragged_uniform;
+    }
+    // Batch-input target buffers are skipped (content invariant per bucket)
+    // but their r-sliced views use the same prefix math -- validate them too.
+    if (viable) {
+      for (const auto& batch_input : StateForModel()->BatchInputs()) {
+        for (const auto& bi_name : batch_input.TargetNames()) {
+          const auto idx_it = input_index_map_.find(bi_name);
+          if (idx_it == input_index_map_.end() ||
+              static_cast<size_t>(idx_it->second) >=
+                  prestaged_entry_->static_inputs.size() ||
+              !prestaged_entry_->static_inputs[idx_it->second].is_cuda() ||
+              (prestaged_entry_->static_inputs[idx_it->second].size(0) %
+                   prestaged_bucket_ !=
+               0)) {
+            viable = false;
+            break;
+          }
+        }
+        if (!viable) {
+          break;
+        }
+      }
+    }
+    if (!viable) {
+      prestaged_entry_ = nullptr;
+      prestaged_bucket_ = -1;
+    }
+  }
+#endif
+
+  // Pass 2: collect. Prestaged batches are written by the collector DIRECTLY
+  // into the graph entry's static input buffers (fixed replay addresses) --
+  // the real requests occupy the first r slots and the padded tail is zeroed
+  // here, replacing PadRequestsUp + the replay-time copy_ pass entirely.
+  for (uint32_t input_idx = 0; input_idx < input_count; input_idx++) {
+    const DeclaredInput& info = declared[input_idx];
+    const std::vector<int64_t>& batchn_shape = info.batchn_shape;
+    const auto torch_dtype = ConvertDataTypeToTorchType(info.datatype);
+
+#ifdef TRITON_ENABLE_GPU
+    if (prestaged_entry_ != nullptr) {
+      const int64_t r = static_cast<int64_t>(total_batch_size);
+      torch::Tensor& st =
+          prestaged_entry_->static_inputs[input_index_map_[info.name]];
+      const size_t batchn_byte_size = static_cast<size_t>(
+          info.batchn_elements * st.element_size());
+      RETURN_IF_ERROR(collector->ProcessTensor(
+          info.name, static_cast<char*>(st.data_ptr()), batchn_byte_size,
+          TRITONSERVER_MEMORY_GPU, device_.index()));
+      const int64_t prefix_dim0 = r * (st.size(0) / prestaged_bucket_);
+      if (prefix_dim0 < st.size(0)) {
+        // Zero the padded tail (also clears stale rows from a previous,
+        // larger batch). On the instance stream so the pre-replay event in
+        // ReplayCudaGraphEntry orders it before the graph reads.
+        const c10::cuda::CUDAStream prev_stream =
+            c10::cuda::getCurrentCUDAStream(device_.index());
+        c10::cuda::setCurrentCUDAStream(c10::cuda::getStreamFromExternal(
+            GetCudaStreamByInstanceKind(), device_.index()));
+        st.narrow(0, prefix_dim0, st.size(0) - prefix_dim0).zero_();
+        c10::cuda::setCurrentCUDAStream(prev_stream);
+      }
+      // Expose the r-sized view for shape derivation and eager fallback.
+      (*input_tensors)[input_index_map_[info.name]] =
+          st.narrow(0, 0, prefix_dim0);
+      continue;
+    }
+#endif
 
     // The input must be in contiguous CPU/GPU memory.
     std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>> alloc_perference;
@@ -1424,21 +1639,10 @@ ModelInstanceState::SetInputTensors(
     TRITONSERVER_MemoryType memory_type;
     int64_t memory_type_id;
     RETURN_IF_ERROR(collector->ProcessTensor(
-        input_name, nullptr, 0, alloc_perference, &input_buffer,
+        info.name, nullptr, 0, alloc_perference, &input_buffer,
         &batchn_byte_size, &memory_type, &memory_type_id));
 
-    // AOTInductor does not support string inputs
-    if (input_datatype == TRITONSERVER_TYPE_BYTES) {
-      return TRITONSERVER_ErrorNew(
-          TRITONSERVER_ERROR_INVALID_ARG,
-          (std::string("AOTInductor models do not support string/bytes input "
-                       "type for input '") +
-           input_name + "'")
-              .c_str());
-    }
-
     // Create Torch tensor
-    const auto torch_dtype = ConvertDataTypeToTorchType(input_datatype);
     torch::TensorOptions options{torch_dtype.second};
     auto updated_options = (memory_type == TRITONSERVER_MEMORY_GPU)
                                ? options.device(torch::kCUDA, device_.index())
@@ -1448,12 +1652,12 @@ ModelInstanceState::SetInputTensors(
       // Remove constness to align with the signature of torch::from_blob()
       torch::Tensor input_tensor = torch::from_blob(
           const_cast<char*>(input_buffer), batchn_shape, updated_options);
-      (*input_tensors)[input_index_map_[input_name]] = input_tensor;
+      (*input_tensors)[input_index_map_[info.name]] = input_tensor;
     } else {
       // torch:from_blob seems not working when the input size is 0
       // create zero-length inputs directly
       torch::Tensor input_tensor = torch::zeros(batchn_shape, updated_options);
-      (*input_tensors)[input_index_map_[input_name]] = input_tensor;
+      (*input_tensors)[input_index_map_[info.name]] = input_tensor;
     }
   }
 
@@ -1463,6 +1667,22 @@ ModelInstanceState::SetInputTensors(
 
     for (const auto& input_name : batch_input.TargetNames()) {
       input_names->emplace_back(input_name.c_str());
+
+#ifdef TRITON_ENABLE_GPU
+      if (prestaged_entry_ != nullptr) {
+        // Prestaged replay reads the captured static buffer directly, and a
+        // bucket's batch-input content is invariant across batches (uniform
+        // per-request widths make the accumulated-count values identical to
+        // what capture recorded). Skip collection; expose an r-sliced view
+        // for shape derivation and eager fallback.
+        const auto idx = input_index_map_[input_name];
+        torch::Tensor& st = prestaged_entry_->static_inputs[idx];
+        const int64_t prefix_dim0 = static_cast<int64_t>(total_batch_size) *
+                                    (st.size(0) / prestaged_bucket_);
+        (*input_tensors)[idx] = st.narrow(0, 0, prefix_dim0);
+        continue;
+      }
+#endif
 
       const char* dst_buffer;
       size_t dst_buffer_byte_size;
