@@ -556,7 +556,10 @@ ModelInstanceState::ExecuteWithCudaGraph(
   // the real traffic width differs, a wrong-shape warmup entry would be
   // replayed and copy_ would shape-mismatch every request -- evict all warmup
   // captures here so lazy capture re-populates at the real shape.
-  if (!warmup_widths_checked_) {
+  // Ragged-wire batches have varying per-request widths by design -- they can
+  // neither validate nor invalidate the warmup captures, so only uniform
+  // batches may run (and latch) the width self-heal below.
+  if (!warmup_widths_checked_ && !batch_ragged_nonuniform_) {
     warmup_widths_checked_ = true;
     const int64_t cfg_single = model_state_->CudaGraphWarmupSingleWidth();
     const int64_t cfg_multi = model_state_->CudaGraphWarmupMultiWidth();
@@ -600,6 +603,16 @@ ModelInstanceState::ExecuteWithCudaGraph(
     prestaged_bucket_ = -1;
     return ReplayCudaGraphEntry(
         e, r, bucket, /*copy_from=*/nullptr, output_tensors);
+  }
+
+  // Ragged-wire batches (non-uniform per-request widths) can only replay via
+  // prestage, which places rows into the captured bucket layout. The slow
+  // path below derives per-request width as numel/r (PadRequestsUp) and would
+  // compute garbage on a ragged batch -- and a capture at a ragged shape would
+  // poison the cache. Go straight to eager for these.
+  if (batch_ragged_nonuniform_) {
+    model_state_->CudaGraphMetricEagerFallback();
+    return false;
   }
 
   const auto& buckets = model_state_->CudaGraphBatchSizes();
@@ -1114,6 +1127,7 @@ ModelInstanceState::ProcessRequests(
   // re-checked in SetInputTensors before any payload is consumed.
   prestaged_entry_ = nullptr;
   prestaged_bucket_ = -1;
+  batch_ragged_nonuniform_ = false;
   if (!all_response_failed && model_state_->EnabledCudaGraph() &&
       !device_.is_cpu()) {
     prestaged_entry_ = FindReadyCudaGraphEntry(
@@ -1475,7 +1489,11 @@ ModelInstanceState::SetInputTensors(
     TRITONSERVER_DataType datatype = TRITONSERVER_TYPE_INVALID;
     std::vector<int64_t> batchn_shape;
     int64_t batchn_elements = 0;
+    bool is_ragged = false;
     bool ragged_uniform = true;
+    // Per-request element counts (ragged inputs only): drives the ragged-wire
+    // per-slot placement and its fit checks.
+    std::vector<int64_t> per_request_elements;
   };
   std::vector<DeclaredInput> declared(input_count);
   for (uint32_t input_idx = 0; input_idx < input_count; input_idx++) {
@@ -1510,7 +1528,9 @@ ModelInstanceState::SetInputTensors(
     // [total_batch_size, ...] for non-ragged input and
     // [total_element_count] for ragged input (non-nested tensor)
     if (StateForModel()->IsInputRagged(input_name)) {
+      info.is_ragged = true;
       info.batchn_shape = std::vector<int64_t>{0};
+      info.per_request_elements.reserve(request_count);
       int64_t first_element_cnt = -1;
       for (size_t idx = 0; idx < request_count; idx++) {
         TRITONBACKEND_Input* input;
@@ -1533,8 +1553,14 @@ ModelInstanceState::SetInputTensors(
         } else if (element_cnt != first_element_cnt) {
           info.ragged_uniform = false;
         }
+        info.per_request_elements.push_back(element_cnt);
         info.batchn_shape[0] += element_cnt;
       }
+#ifdef TRITON_ENABLE_GPU
+      if (!info.ragged_uniform) {
+        batch_ragged_nonuniform_ = true;
+      }
+#endif
     } else {
       info.batchn_shape =
           std::vector<int64_t>(input_shape, input_shape + input_dims_count);
@@ -1577,9 +1603,24 @@ ModelInstanceState::SetInputTensors(
                (st.scalar_type() == torch_dtype.second) &&
                (st.numel() % prestaged_bucket_ == 0) &&
                (st.size(0) % prestaged_bucket_ == 0) &&
-               (info.batchn_elements ==
-                r * (st.numel() / prestaged_bucket_)) &&
-               (info.batchn_elements > 0) && info.ragged_uniform;
+               (info.batchn_elements > 0);
+      if (viable) {
+        const int64_t slot_elements = st.numel() / prestaged_bucket_;
+        if (info.is_ragged) {
+          // Ragged wire: each request's rows must FIT its bucket slot (the
+          // per-slot placement pads the remainder). Uniform padded wire is the
+          // degenerate case where every count equals the slot exactly.
+          viable = !info.per_request_elements.empty();
+          for (const int64_t e : info.per_request_elements) {
+            if (e <= 0 || e > slot_elements) {
+              viable = false;
+              break;
+            }
+          }
+        } else {
+          viable = (info.batchn_elements == r * slot_elements);
+        }
+      }
     }
     // Batch-input target buffers are skipped (content invariant per bucket)
     // but their r-sliced views use the same prefix math -- validate them too.
@@ -1624,13 +1665,26 @@ ModelInstanceState::SetInputTensors(
       const int64_t r = static_cast<int64_t>(total_batch_size);
       torch::Tensor& st =
           prestaged_entry_->static_inputs[input_index_map_[info.name]];
-      const size_t batchn_byte_size = static_cast<size_t>(
-          info.batchn_elements * st.element_size());
-      // This ProcessTensor overload returns void; per-request failures are
-      // reported through `responses` internally.
-      collector->ProcessTensor(
-          info.name, static_cast<char*>(st.data_ptr()), batchn_byte_size,
-          TRITONSERVER_MEMORY_GPU, device_.index());
+      const int64_t slot_elements = st.numel() / prestaged_bucket_;
+      // Ragged wire (requests below their slot capacity): place each request's
+      // real rows at its slot offset and zero the per-slot tail -- the batch
+      // lands in the exact uniform bucket layout the graph was captured with.
+      // Uniform padded wire (every count == slot) keeps the collector's single
+      // contiguous write.
+      const bool needs_slot_placement =
+          info.is_ragged && (info.batchn_elements != r * slot_elements);
+      if (needs_slot_placement) {
+        RETURN_IF_ERROR(StageRaggedInputPerRequest(
+            info.name, requests, request_count, st, slot_elements));
+      } else {
+        const size_t batchn_byte_size = static_cast<size_t>(
+            info.batchn_elements * st.element_size());
+        // This ProcessTensor overload returns void; per-request failures are
+        // reported through `responses` internally.
+        collector->ProcessTensor(
+            info.name, static_cast<char*>(st.data_ptr()), batchn_byte_size,
+            TRITONSERVER_MEMORY_GPU, device_.index());
+      }
       const int64_t prefix_dim0 = r * (st.size(0) / prestaged_bucket_);
       if (prefix_dim0 < st.size(0)) {
         // Zero the padded tail (also clears stale rows from a previous,
@@ -1746,6 +1800,64 @@ ModelInstanceState::SetInputTensors(
 
   return nullptr;
 }
+
+#ifdef TRITON_ENABLE_GPU
+TRITONSERVER_Error*
+ModelInstanceState::StageRaggedInputPerRequest(
+    const char* input_name, TRITONBACKEND_Request** requests,
+    const uint32_t request_count, torch::Tensor& dst, int64_t slot_elements)
+{
+  char* dst_base = static_cast<char*>(dst.data_ptr());
+  const size_t esz = dst.element_size();
+  const size_t slot_bytes = static_cast<size_t>(slot_elements) * esz;
+  cudaStream_t stream = GetCudaStreamByInstanceKind();
+
+  for (uint32_t ridx = 0; ridx < request_count; ++ridx) {
+    TRITONBACKEND_Input* input;
+    RETURN_IF_ERROR(
+        TRITONBACKEND_RequestInput(requests[ridx], input_name, &input));
+    uint32_t buffer_count = 0;
+    RETURN_IF_ERROR(TRITONBACKEND_InputProperties(
+        input, nullptr, nullptr, nullptr, nullptr, nullptr, &buffer_count));
+
+    char* slot_dst = dst_base + static_cast<size_t>(ridx) * slot_bytes;
+    size_t written = 0;
+    for (uint32_t b = 0; b < buffer_count; ++b) {
+      const void* src = nullptr;
+      uint64_t src_bytes = 0;
+      TRITONSERVER_MemoryType mem_type = TRITONSERVER_MEMORY_CPU;
+      int64_t mem_id = 0;
+      RETURN_IF_ERROR(TRITONBACKEND_InputBuffer(
+          input, b, &src, &src_bytes, &mem_type, &mem_id));
+      if (written + src_bytes > slot_bytes) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INVALID_ARG,
+            (std::string("ragged input '") + input_name + "' request " +
+             std::to_string(ridx) + " exceeds its bucket slot (" +
+             std::to_string(written + src_bytes) + " > " +
+             std::to_string(slot_bytes) + " bytes)")
+                .c_str());
+      }
+      const cudaMemcpyKind kind = (mem_type == TRITONSERVER_MEMORY_GPU)
+                                      ? cudaMemcpyDeviceToDevice
+                                      : cudaMemcpyHostToDevice;
+      RETURN_IF_ERROR(ConvertCUDAStatusToTritonError(
+          cudaMemcpyAsync(slot_dst + written, src, src_bytes, kind, stream),
+          TRITONSERVER_ERROR_INTERNAL,
+          "CUDA-graph ragged prestage copy failed"));
+      written += src_bytes;
+    }
+    if (written < slot_bytes) {
+      // Zero this slot's tail (also clears stale rows from previous batches).
+      RETURN_IF_ERROR(ConvertCUDAStatusToTritonError(
+          cudaMemsetAsync(slot_dst + written, 0, slot_bytes - written, stream),
+          TRITONSERVER_ERROR_INTERNAL,
+          "CUDA-graph ragged prestage tail memset failed"));
+    }
+  }
+  return nullptr;
+}
+#endif
 
 ModelState*
 ModelInstanceState::StateForModel() const

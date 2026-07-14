@@ -142,6 +142,14 @@ class ModelInstanceState : public BackendModelInstance {
   // PadRequestsUp + static copy_ passes. nullptr = normal (slow) path.
   CudaGraphEntry* prestaged_entry_ = nullptr;
   int64_t prestaged_bucket_ = -1;
+
+  // Per-batch: the ragged input's per-request element counts are NOT uniform
+  // (ragged wire format -- the preprocessor sent real rows without padding to
+  // the candidate bucket). Guards two paths that assume uniform widths: the
+  // warmup width self-heal (a ragged batch cannot invalidate warmup captures)
+  // and the slow-path PadRequestsUp/capture (per-request width math would be
+  // garbage on a ragged batch; such batches replay via prestage or run eager).
+  bool batch_ragged_nonuniform_ = false;
 #endif
 
  public:
@@ -239,6 +247,15 @@ class ModelInstanceState : public BackendModelInstance {
       CudaGraphEntry& e, int64_t r, int64_t bucket,
       const std::vector<torch::Tensor>* copy_from,
       std::vector<torch::Tensor>* output_tensors);
+
+  // Ragged-wire prestaging: place each request's real rows at its fixed slot
+  // offset in the static buffer (slot i starts at i * slot_bytes) and zero the
+  // per-slot tail, so an unpadded (ragged) wire batch lands in the exact
+  // uniform bucket layout the graph was captured with. Copies + memsets are
+  // issued async on the instance stream (the pre-replay event orders them).
+  TRITONSERVER_Error* StageRaggedInputPerRequest(
+      const char* input_name, TRITONBACKEND_Request** requests,
+      const uint32_t request_count, torch::Tensor& dst, int64_t slot_elements);
 #endif
 
   // Get the naming convention for inputs/outputs from the model configuration
