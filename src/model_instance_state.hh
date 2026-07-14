@@ -94,6 +94,14 @@ class ModelInstanceState : public BackendModelInstance {
   // (KIND_GPU + ENABLE_CUDA_GRAPH) in the ctor and destroyed in the destructor.
   cudaEvent_t cuda_graph_input_ready_event_ = nullptr;
 
+  // Mirror of the above for the output direction: orders the instance stream
+  // (responder output copies + next batch's input collection) behind the graph
+  // replay, replacing the host-blocking post-replay stream.synchronize(). The
+  // host proceeds to response preparation while the replay drains; the
+  // responder's Finalize gate in ReadOutputTensors confirms completion before
+  // responses send.
+  cudaEvent_t cuda_graph_output_ready_event_ = nullptr;
+
   // Store the cuda streams created for the 'KIND_MODEL' instance group.
   std::vector<cudaStream_t> stream_vec_;
 
@@ -125,6 +133,15 @@ class ModelInstanceState : public BackendModelInstance {
   // re-populates at the real shape (the cache is keyed only by "R=<bucket>",
   // not by width).
   bool warmup_widths_checked_ = false;
+
+  // Input prestaging (per-batch state; Triton runs batches serially per
+  // instance). When SetInputTensors finds an already-captured bucket whose
+  // widths match the incoming batch, it collects the request payloads DIRECTLY
+  // into that entry's static_inputs (H2D into the graph's fixed addresses) and
+  // records the entry here; ExecuteWithCudaGraph then replays without the
+  // PadRequestsUp + static copy_ passes. nullptr = normal (slow) path.
+  CudaGraphEntry* prestaged_entry_ = nullptr;
+  int64_t prestaged_bucket_ = -1;
 #endif
 
  public:
@@ -204,6 +221,24 @@ class ModelInstanceState : public BackendModelInstance {
   // are all configured. Never throws (a warmup failure is logged; lazy capture
   // covers it).
   void WarmupCudaGraphs();
+
+  // Input prestaging lookup: the bucket the slow path WOULD select for R=r,
+  // but only if its graph is already captured (never captures). Mirrors the
+  // ExecuteWithCudaGraph selection exactly: first healthy bucket >= r; if that
+  // bucket is not captured yet, returns nullptr so the slow path performs its
+  // capture-on-first-use. bucket_out is set only on a hit.
+  CudaGraphEntry* FindReadyCudaGraphEntry(int64_t r, int64_t* bucket_out);
+
+  // Replay `e` for a real request count r at R=bucket. When copy_from is
+  // non-null, the inputs are first copied into e.static_inputs (the slow
+  // path); nullptr means the batch was prestaged directly into the static
+  // buffers by SetInputTensors and the copy is skipped. Appends r-sliced
+  // cloned outputs to output_tensors. Returns false on replay failure (logged
+  // + eager-fallback metric recorded; caller falls back to eager).
+  bool ReplayCudaGraphEntry(
+      CudaGraphEntry& e, int64_t r, int64_t bucket,
+      const std::vector<torch::Tensor>* copy_from,
+      std::vector<torch::Tensor>* output_tensors);
 #endif
 
   // Get the naming convention for inputs/outputs from the model configuration
