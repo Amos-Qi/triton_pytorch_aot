@@ -73,6 +73,11 @@ ModelInstanceState::ModelInstanceState(
               &cuda_graph_input_ready_event_, cudaEventDisableTiming),
           TRITONSERVER_ERROR_INTERNAL,
           "Failed to create CUDA-graph input-ready event"));
+      THROW_IF_BACKEND_INSTANCE_ERROR(ConvertCUDAStatusToTritonError(
+          cudaEventCreateWithFlags(
+              &cuda_graph_output_ready_event_, cudaEventDisableTiming),
+          TRITONSERVER_ERROR_INTERNAL,
+          "Failed to create CUDA-graph output-ready event"));
     }
 #endif
   }
@@ -179,6 +184,15 @@ ModelInstanceState::~ModelInstanceState()
             "Failed to destroy CUDA-graph input-ready event"),
         "~ModelInstanceState error: ");
     cuda_graph_input_ready_event_ = nullptr;
+  }
+  if (cuda_graph_output_ready_event_ != nullptr) {
+    LOG_IF_ERROR(
+        ConvertCUDAStatusToTritonError(
+            cudaEventDestroy(cuda_graph_output_ready_event_),
+            TRITONSERVER_ERROR_INTERNAL,
+            "Failed to destroy CUDA-graph output-ready event"),
+        "~ModelInstanceState error: ");
+    cuda_graph_output_ready_event_ = nullptr;
   }
 #endif
 
@@ -690,13 +704,24 @@ ModelInstanceState::ReplayCudaGraphEntry(
       }
     }
     e.graph->replay();
-    e.stream.synchronize();
+    // Order the instance stream behind the replay via an event instead of a
+    // host-blocking sync: the responder's output copies (and the next batch's
+    // input collection) are issued on the instance stream, so they wait for
+    // the replay on-device while the host proceeds straight to response
+    // preparation. ReadOutputTensors touches only tensor metadata until its
+    // Finalize gate (cudaStreamQuery + sync) confirms completion before the
+    // responses send.
+    cudaEventRecord(cuda_graph_output_ready_event_, e.stream.stream());
+    cudaStreamWaitEvent(
+        GetCudaStreamByInstanceKind(), cuda_graph_output_ready_event_, 0);
 
-    // Slice each output's batch dim (dim 0 = R) back to the real request count
-    // -- the padded (dummy) request rows are discarded. clone so the next
-    // replay + the Triton responder don't race on the static output buffers.
+    // Slice each output's batch dim (dim 0 = R) back to the real request
+    // count -- the padded (dummy) request rows are discarded. Views, not
+    // clones: batches are serialized per instance, and the responder finishes
+    // copying out of the static buffers (its Finalize sync) before this
+    // request cycle ends, so the next replay cannot race them.
     for (const auto& o : e.static_outputs) {
-      output_tensors->push_back((r == bucket ? o : o.narrow(0, 0, r)).clone());
+      output_tensors->push_back(r == bucket ? o : o.narrow(0, 0, r));
     }
 
     c10::cuda::setCurrentCUDAStream(prev_stream);

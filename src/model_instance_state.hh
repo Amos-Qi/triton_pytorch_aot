@@ -94,6 +94,14 @@ class ModelInstanceState : public BackendModelInstance {
   // (KIND_GPU + ENABLE_CUDA_GRAPH) in the ctor and destroyed in the destructor.
   cudaEvent_t cuda_graph_input_ready_event_ = nullptr;
 
+  // Mirror of the above for the output direction: orders the instance stream
+  // (responder output copies + next batch's input collection) behind the graph
+  // replay, replacing the host-blocking post-replay stream.synchronize(). The
+  // host proceeds to response preparation while the replay drains; the
+  // responder's Finalize gate in ReadOutputTensors confirms completion before
+  // responses send.
+  cudaEvent_t cuda_graph_output_ready_event_ = nullptr;
+
   // Store the cuda streams created for the 'KIND_MODEL' instance group.
   std::vector<cudaStream_t> stream_vec_;
 
