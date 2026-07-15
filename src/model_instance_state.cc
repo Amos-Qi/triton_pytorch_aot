@@ -89,6 +89,16 @@ ModelInstanceState::ModelInstanceState(
   THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
       ArtifactFilename(), device_, &model_path_, Kind(), &aoti_model_));
 
+  if (model_state->PartialSplit()) {
+    // Partial-graph split: aoti_model_ (model.pt2) is the graph-captured
+    // FRONT; the eager row-dynamic TRUNK loads from model_trunk.pt2.
+    // ParseParameters forced weight sharing off (the shared-loader cache is
+    // keyed by device only and would collide the two loaders).
+    THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
+        "model_trunk.pt2", device_, &trunk_model_path_, Kind(),
+        &trunk_aoti_model_));
+  }
+
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_MODEL) {
 #ifdef TRITON_ENABLE_GPU
     // Since we cannot determine the exact devices used by the model, we create
@@ -314,6 +324,14 @@ ModelInstanceState::Execute(
     torch::NoGradGuard no_grad;
 
 #ifdef TRITON_ENABLE_GPU
+    // Partial-graph split path (opt-in via PARTIAL_SPLIT, GPU only): FRONT
+    // replay (or eager front on the rebuilt padded layout) -> boundary gather
+    // to the real candidate rows -> eager TRUNK. Handles every batch shape
+    // itself; failures throw into the catch below.
+    if (model_state_->PartialSplit() && !device_.is_cpu()) {
+      ExecutePartialSplit(input_tensors, output_tensors);
+      return;
+    }
     // Whole-forward CUDA-graph path (opt-in via ENABLE_CUDA_GRAPH, GPU only):
     // capture-on-first-use + replay for a fixed input shape. Falls through to
     // the eager run below if capture is not possible for these inputs.
@@ -696,7 +714,7 @@ bool
 ModelInstanceState::ReplayCudaGraphEntry(
     CudaGraphEntry& e, int64_t r, int64_t bucket,
     const std::vector<torch::Tensor>* copy_from,
-    std::vector<torch::Tensor>* output_tensors)
+    std::vector<torch::Tensor>* output_tensors, bool narrow_outputs)
 {
   const c10::cuda::CUDAStream prev_stream =
       c10::cuda::getCurrentCUDAStream(device_.index());
@@ -734,7 +752,11 @@ ModelInstanceState::ReplayCudaGraphEntry(
     // copying out of the static buffers (its Finalize sync) before this
     // request cycle ends, so the next replay cannot race them.
     for (const auto& o : e.static_outputs) {
-      output_tensors->push_back(r == bucket ? o : o.narrow(0, 0, r));
+      // Partial split passes narrow_outputs=false: the front's seam outputs
+      // are row-major (R*candidate_bucket, w), so an R-narrow would slice
+      // rows, not requests; the boundary gather selects the real rows instead.
+      output_tensors->push_back(
+          (!narrow_outputs || r == bucket) ? o : o.narrow(0, 0, r));
     }
 
     c10::cuda::setCurrentCUDAStream(prev_stream);
@@ -754,6 +776,188 @@ ModelInstanceState::ReplayCudaGraphEntry(
             .c_str());
     return false;
   }
+}
+
+void
+ModelInstanceState::ExecutePartialSplit(
+    std::vector<torch::Tensor>* input_tensors,
+    std::vector<torch::Tensor>* output_tensors)
+{
+  if (trunk_aoti_model_ == nullptr) {
+    throw std::runtime_error(
+        "partial split is enabled but the trunk model is not loaded");
+  }
+  // Only the v3_q3a 3-input request-batch layout is supported (same
+  // restriction as the whole-forward graph path).
+  if (input_tensors->size() != 3) {
+    throw std::runtime_error(
+        "partial split requires the 3-input request-batch layout, got " +
+        std::to_string(input_tensors->size()) + " inputs");
+  }
+  const int64_t r = static_cast<int64_t>(partial_split_row_counts_.size());
+  if (r <= 0) {
+    throw std::runtime_error(
+        "partial split: no per-request row counts were derived (is the multi "
+        "input ragged in the model config?)");
+  }
+  const int64_t row_width = model_state_->PartialSplitMultiRowWidth();
+  const int64_t slot_rows =
+      model_state_->CudaGraphWarmupMultiWidth() / row_width;
+
+  const auto find_idx = [&](const char* name) -> size_t {
+    const auto it = input_index_map_.find(name);
+    if (it == input_index_map_.end()) {
+      throw std::runtime_error(
+          std::string("partial split: required input '") + name +
+          "' not found in the model config");
+    }
+    return static_cast<size_t>(it->second);
+  };
+  const size_t single_idx = find_idx("packed_single_batch_tensor");
+  const size_t multi_idx = find_idx("packed_multiple_batch_tensor");
+  const size_t end_idx = find_idx("request_end_position");
+
+  // Everything below (gather, padded rebuild, trunk run, and the responder's
+  // output copies afterwards) must run on the instance stream so the
+  // pre/post-replay events in ReplayCudaGraphEntry order it against the graph
+  // stream and the collector's H2D writes.
+  c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(
+      GetCudaStreamByInstanceKind(), device_.index()));
+
+  // Boundary gather index: request i's real rows live at its fixed slot
+  // offset (i * slot_rows) in the padded front layout.
+  int64_t total_real_rows = 0;
+  for (const int64_t rows : partial_split_row_counts_) {
+    total_real_rows += rows;
+  }
+  torch::Tensor gather_cpu = torch::empty({total_real_rows}, torch::kLong);
+  {
+    int64_t* out = gather_cpu.data_ptr<int64_t>();
+    size_t k = 0;
+    for (int64_t req = 0; req < r; ++req) {
+      const int64_t base = req * slot_rows;
+      for (int64_t j = 0; j < partial_split_row_counts_[req]; ++j) {
+        out[k++] = base + j;
+      }
+    }
+  }
+  const torch::Tensor gather_idx = gather_cpu.to(device_);
+
+  // ---- FRONT: graph replay via prestage, or eager on the padded layout ----
+  std::vector<torch::Tensor> seam;
+  bool front_done = false;
+  if (model_state_->EnabledCudaGraph() && prestaged_entry_ != nullptr) {
+    CudaGraphEntry& e = *prestaged_entry_;
+    const int64_t bucket = prestaged_bucket_;
+    prestaged_entry_ = nullptr;
+    prestaged_bucket_ = -1;
+    front_done = ReplayCudaGraphEntry(
+        e, r, bucket, /*copy_from=*/nullptr, &seam,
+        /*narrow_outputs=*/false);
+    if (!front_done) {
+      seam.clear();
+    }
+  }
+  if (!front_done) {
+    // Uncaptured bucket / replay failure / graphs disabled: run the front
+    // eagerly at exact R (the dynamic front artifact accepts any R as long as
+    // the layout is padded). The fallback metric keeps the
+    // cudagraph_eager_fallbacks signal meaningful for the split path too.
+    if (model_state_->EnabledCudaGraph()) {
+      model_state_->CudaGraphMetricEagerFallback();
+    }
+    seam = aoti_model_->run(BuildPaddedFrontInputs(
+        *input_tensors, r, slot_rows, row_width, gather_idx, single_idx,
+        multi_idx, end_idx));
+  }
+
+  // ---- Boundary gather + TRUNK (eager, real rows) ----
+  const int64_t total_real_elements = total_real_rows * row_width;
+  std::vector<torch::Tensor> trunk_inputs;
+  trunk_inputs.reserve(3 + seam.size());
+
+  torch::Tensor single = (*input_tensors)[single_idx];
+  if (single.dim() >= 2 && single.size(0) != r) {
+    // Prestaged batches expose r-narrowed views already; this covers any
+    // other padded source defensively.
+    single = single.narrow(0, 0, r);
+  }
+  trunk_inputs.push_back(single);
+
+  torch::Tensor multi = (*input_tensors)[multi_idx];
+  if (multi.numel() == total_real_elements) {
+    // Raw ragged wire: the collected tensor IS the real rows, in order.
+    trunk_inputs.push_back(multi.reshape({-1}));
+  } else {
+    // Padded source (prestaged static view): gather the real rows out.
+    trunk_inputs.push_back(
+        multi.reshape({-1, row_width}).index_select(0, gather_idx).reshape({-1}));
+  }
+
+  // Real accumulated element counts, in the wire dtype. Rebuilt host-side:
+  // the prestaged path exposes the captured bucket-strided buffer, not the
+  // batch's real values, so the collected tensor cannot be trusted here.
+  torch::Tensor end_ref = (*input_tensors)[end_idx];
+  torch::Tensor end_cpu = torch::empty({r}, torch::kLong);
+  {
+    int64_t* out = end_cpu.data_ptr<int64_t>();
+    int64_t acc = 0;
+    for (int64_t req = 0; req < r; ++req) {
+      acc += partial_split_row_counts_[req] * row_width;
+      out[req] = acc;
+    }
+  }
+  trunk_inputs.push_back(end_cpu.to(end_ref.scalar_type()).to(device_));
+
+  for (const auto& seam_tensor : seam) {
+    trunk_inputs.push_back(seam_tensor.index_select(0, gather_idx));
+  }
+
+  std::vector<torch::Tensor> trunk_outputs =
+      trunk_aoti_model_->run(trunk_inputs);
+  for (auto& out : trunk_outputs) {
+    output_tensors->push_back(out);
+  }
+}
+
+std::vector<torch::Tensor>
+ModelInstanceState::BuildPaddedFrontInputs(
+    const std::vector<torch::Tensor>& input_tensors, int64_t r,
+    int64_t slot_rows, int64_t row_width, const torch::Tensor& gather_idx,
+    size_t single_idx, size_t multi_idx, size_t end_idx)
+{
+  std::vector<torch::Tensor> padded(input_tensors.size());
+
+  torch::Tensor single = input_tensors[single_idx];
+  if (single.dim() >= 2 && single.size(0) != r) {
+    single = single.narrow(0, 0, r);
+  }
+  padded[single_idx] = single;
+
+  torch::Tensor multi = input_tensors[multi_idx];
+  const int64_t padded_elements = r * slot_rows * row_width;
+  if (multi.numel() == padded_elements) {
+    // Already in the padded layout (prestaged view after a failed replay, or
+    // every request genuinely fills its bucket).
+    padded[multi_idx] = multi.reshape({-1});
+  } else {
+    // Scatter the real rows to their slot offsets; padding rows stay zero --
+    // the same layout StageRaggedInputPerRequest produces during H2D.
+    torch::Tensor buf =
+        torch::zeros({r * slot_rows, row_width}, multi.options());
+    buf.index_copy_(0, gather_idx, multi.reshape({-1, row_width}));
+    padded[multi_idx] = buf.reshape({-1});
+  }
+
+  // Bucket-strided accumulated element counts, in the wire dtype -- what the
+  // padded layout's end positions look like by construction.
+  torch::Tensor end_ref = input_tensors[end_idx];
+  padded[end_idx] =
+      torch::arange(1, r + 1, torch::TensorOptions().dtype(torch::kLong))
+          .mul_(slot_rows * row_width)
+          .to(end_ref.scalar_type())
+          .to(device_);
+  return padded;
 }
 
 ModelInstanceState::CudaGraphEntry*
@@ -1128,6 +1332,7 @@ ModelInstanceState::ProcessRequests(
   prestaged_entry_ = nullptr;
   prestaged_bucket_ = -1;
   batch_ragged_nonuniform_ = false;
+  partial_split_row_counts_.clear();
   if (!all_response_failed && model_state_->EnabledCudaGraph() &&
       !device_.is_cpu()) {
     prestaged_entry_ = FindReadyCudaGraphEntry(
@@ -1559,6 +1764,27 @@ ModelInstanceState::SetInputTensors(
 #ifdef TRITON_ENABLE_GPU
       if (!info.ragged_uniform) {
         batch_ragged_nonuniform_ = true;
+      }
+      // Partial-graph split: the ragged multi input's per-request element
+      // counts are the batch's REAL candidate rows (the wire ships real rows).
+      // Persist them as row counts for the boundary gather + trunk end
+      // positions. The v3 layout has exactly one ragged input.
+      if (model_state_->PartialSplit() && partial_split_row_counts_.empty()) {
+        const int64_t row_width = model_state_->PartialSplitMultiRowWidth();
+        partial_split_row_counts_.reserve(info.per_request_elements.size());
+        for (const int64_t element_cnt : info.per_request_elements) {
+          if (element_cnt <= 0 || (element_cnt % row_width) != 0) {
+            partial_split_row_counts_.clear();
+            return TRITONSERVER_ErrorNew(
+                TRITONSERVER_ERROR_INVALID_ARG,
+                (std::string("partial split: ragged input '") + info.name +
+                 "' request element count " + std::to_string(element_cnt) +
+                 " is not a positive multiple of the row width " +
+                 std::to_string(row_width))
+                    .c_str());
+          }
+          partial_split_row_counts_.push_back(element_cnt / row_width);
+        }
       }
 #endif
     } else {

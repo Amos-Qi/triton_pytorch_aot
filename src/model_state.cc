@@ -43,7 +43,8 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
       enable_cudnn_(true), enable_cache_cleaning_(false),
       enable_weight_sharing_(false), enable_cuda_graph_(false),
       disable_pinned_input_(false), total_instance_count_(1),
-      cuda_graph_warmup_single_width_(0), cuda_graph_warmup_multi_width_(0)
+      cuda_graph_warmup_single_width_(0), cuda_graph_warmup_multi_width_(0),
+      partial_split_(false), partial_split_multi_row_width_(0)
 {
 }
 
@@ -664,6 +665,84 @@ ModelState::ParseParameters()
                " for model instance '" + Name() + "'")
                   .c_str());
         }
+      }
+    }
+
+    // 'PARTIAL_SPLIT' (bool): partial-graph split serving. model.pt2 is the
+    // graph-captured FRONT (padded wire -> seam activations) and
+    // model_trunk.pt2 is the row-dynamic TRUNK (real-row packed features +
+    // boundary-gathered seam -> served heads), run eager after the front.
+    err = ParseParameter(params, "PARTIAL_SPLIT", &partial_split_);
+    if (err != nullptr) {
+      if (TRITONSERVER_ErrorCode(err) != TRITONSERVER_ERROR_NOT_FOUND) {
+        return err;
+      } else {
+        TRITONSERVER_ErrorDelete(err);
+      }
+    } else {
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Partial-graph split is ") +
+           (partial_split_ ? "enabled" : "disabled") +
+           " for model instance '" + Name() + "'")
+              .c_str());
+    }
+
+    // 'PARTIAL_SPLIT_MULTI_ROW_WIDTH' (int64): the per-candidate-row element
+    // width (F2) of the ragged packed_multiple input. The boundary gather
+    // needs it to convert the wire's per-request element counts into row
+    // counts, and the eager-front path needs it to rebuild the padded layout.
+    {
+      triton::common::TritonJson::Value w;
+      if (params.Find("PARTIAL_SPLIT_MULTI_ROW_WIDTH", &w)) {
+        std::string val;
+        TRITONSERVER_Error* serr = w.MemberAsString("string_value", &val);
+        if (serr != nullptr) {
+          TRITONSERVER_ErrorDelete(serr);
+        } else {
+          try {
+            partial_split_multi_row_width_ = std::stoll(val);
+          }
+          catch (...) {
+          }
+          LOG_MESSAGE(
+              TRITONSERVER_LOG_INFO,
+              (std::string("Partial-split multi row width: ") +
+               std::to_string(partial_split_multi_row_width_) +
+               " for model instance '" + Name() + "'")
+                  .c_str());
+        }
+      }
+    }
+
+    // The split path's gather/pad math is undefined without the row width and
+    // the per-request slot width (candidate_bucket * F2, shipped as the warmup
+    // multi width). Fail load loudly rather than serving wrong numbers.
+    if (partial_split_) {
+      if (partial_split_multi_row_width_ <= 0 ||
+          cuda_graph_warmup_multi_width_ <= 0 ||
+          (cuda_graph_warmup_multi_width_ % partial_split_multi_row_width_) !=
+              0) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INVALID_ARG,
+            (std::string("PARTIAL_SPLIT requires PARTIAL_SPLIT_MULTI_ROW_WIDTH "
+                         "and CUDA_GRAPH_WARMUP_MULTI_WIDTH (a positive "
+                         "multiple of the row width); got row_width=") +
+             std::to_string(partial_split_multi_row_width_) +
+             " multi_width=" + std::to_string(cuda_graph_warmup_multi_width_) +
+             " for model '" + Name() + "'")
+                .c_str());
+      }
+      if (enable_weight_sharing_) {
+        // LoadModel's shared-loader cache is keyed by device only; the front
+        // and trunk loaders would collide in it.
+        enable_weight_sharing_ = false;
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_WARN,
+            (std::string("PARTIAL_SPLIT forces ENABLE_WEIGHT_SHARING off for "
+                         "model instance '") +
+             Name() + "'")
+                .c_str());
       }
     }
 

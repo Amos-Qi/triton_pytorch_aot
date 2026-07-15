@@ -79,6 +79,10 @@ class ModelState : public triton::backend::BackendModel {
   // back to eager. Empty = capture any first-seen shape (unbounded).
   std::set<int64_t> cuda_graph_batch_sizes_;
 
+  // Partial-graph split members (see the PartialSplit getters).
+  bool partial_split_ = false;
+  int64_t partial_split_multi_row_width_ = 0;
+
   // Load-time CUDA-graph warmup input widths (0 => warmup disabled).
   // single_width is packed_single's F1 (column count); multi_width is the
   // per-request packed_multiple element count (candidate_bucket * F2). Consumed
@@ -159,6 +163,17 @@ class ModelState : public triton::backend::BackendModel {
   int64_t CudaGraphWarmupMultiWidth() const
   {
     return cuda_graph_warmup_multi_width_;
+  }
+
+  // Partial-graph split (PARTIAL_SPLIT): model.pt2 = graph-captured FRONT,
+  // model_trunk.pt2 = eager row-dynamic TRUNK.
+  bool PartialSplit() const { return partial_split_; }
+  // Per-candidate-row element width (F2) of the ragged packed_multiple input
+  // (PARTIAL_SPLIT_MULTI_ROW_WIDTH). Converts per-request element counts to
+  // row counts for the boundary gather.
+  int64_t PartialSplitMultiRowWidth() const
+  {
+    return partial_split_multi_row_width_;
   }
 
   // CUDA-graph Prometheus counters. No-ops when metrics are unavailable. Called

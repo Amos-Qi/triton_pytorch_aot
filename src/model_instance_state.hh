@@ -70,6 +70,12 @@ class ModelInstanceState : public BackendModelInstance {
   std::string model_path_;
 
   std::shared_ptr<torch::inductor::AOTIModelPackageLoader> aoti_model_;
+
+  // Partial-graph split (ModelState::PartialSplit()): the eager row-dynamic
+  // TRUNK loaded from model_trunk.pt2; aoti_model_ then holds the
+  // graph-captured FRONT. Null unless the split is enabled.
+  std::string trunk_model_path_;
+  std::shared_ptr<torch::inductor::AOTIModelPackageLoader> trunk_aoti_model_;
   torch::Device device_;
 
   // Map from configuration name for an input to the index of
@@ -150,6 +156,12 @@ class ModelInstanceState : public BackendModelInstance {
   // and the slow-path PadRequestsUp/capture (per-request width math would be
   // garbage on a ragged batch; such batches replay via prestage or run eager).
   bool batch_ragged_nonuniform_ = false;
+
+  // Partial-graph split, per-batch: REAL candidate-row count per request,
+  // derived in SetInputTensors pass 1 from the ragged multi input's
+  // per-request element counts / PartialSplitMultiRowWidth(). Drives the
+  // boundary gather and the trunk's real end positions.
+  std::vector<int64_t> partial_split_row_counts_;
 #endif
 
  public:
@@ -246,7 +258,25 @@ class ModelInstanceState : public BackendModelInstance {
   bool ReplayCudaGraphEntry(
       CudaGraphEntry& e, int64_t r, int64_t bucket,
       const std::vector<torch::Tensor>* copy_from,
+      std::vector<torch::Tensor>* output_tensors,
+      bool narrow_outputs = true);
+
+  // Partial-graph split execution: FRONT (graph replay via prestage, or eager
+  // on the padded layout) -> boundary gather to real rows -> eager TRUNK.
+  // Appends the trunk's outputs (already at the real request count) to
+  // output_tensors. Throws std::runtime_error on unrecoverable failures
+  // (Execute's catch converts it into error responses).
+  void ExecutePartialSplit(
+      std::vector<torch::Tensor>* input_tensors,
       std::vector<torch::Tensor>* output_tensors);
+
+  // Rebuild the padded (R x candidate-bucket) front layout from the collected
+  // wire tensors for the eager-front path (uncaptured bucket / replay
+  // failure). gather_idx maps real rows to their padded positions.
+  std::vector<torch::Tensor> BuildPaddedFrontInputs(
+      const std::vector<torch::Tensor>& input_tensors, int64_t r,
+      int64_t slot_rows, int64_t row_width, const torch::Tensor& gather_idx,
+      size_t single_idx, size_t multi_idx, size_t end_idx);
 
   // Ragged-wire prestaging: place each request's real rows at its fixed slot
   // offset in the static buffer (slot i starts at i * slot_bytes) and zero the
