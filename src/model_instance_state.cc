@@ -515,6 +515,14 @@ ModelInstanceState::CaptureBucket(
     }
     stream.synchronize();
 
+    // Return the warmup runs' cached activation blocks to CUDA before the
+    // capture allocates its pool: at 6 shared-weight instances the graph pools
+    // fit only if the allocator's cache isn't sitting on the margin (the last
+    // instance's captures were failing OOM by ~one activation set). cudaFree
+    // device-syncs, but capture is already a slow path (load-time warmup, or
+    // a rare lazy capture).
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
     // Capture. Relaxed mode matches the proven spike. All of this instance's
     // buckets share ONE memory pool (only one graph replays at a time per
     // instance), so graph memory scales with the largest bucket, not the sum.
