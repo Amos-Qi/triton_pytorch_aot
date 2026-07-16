@@ -479,6 +479,8 @@ ModelInstanceState::CaptureBucket(
   // std::terminate, so we must not let it run. A capture failure is a rare
   // safety-net path (the intended static shape captures cleanly).
   at::cuda::CUDAGraph* graph = nullptr;
+  // Hoisted out of the try so the failure path can end a dangling capture on it.
+  std::optional<c10::cuda::CUDAStream> capture_stream;
   // One capture at a time model-wide: under weight sharing every instance
   // captures through the SAME single-threaded loader (slot 0), and even
   // per-instance loaders gain nothing from concurrent captures.
@@ -499,6 +501,7 @@ ModelInstanceState::CaptureBucket(
     // Dedicated stream so AOTI's caching-allocator scratch is captured on it.
     c10::cuda::CUDAStream stream =
         c10::cuda::getStreamFromPool(/*isHighPriority=*/false, device_.index());
+    capture_stream = stream;
     c10::cuda::setCurrentCUDAStream(stream);
 
     // Fixed-address input buffers (the graph replays into the same addresses),
@@ -561,6 +564,32 @@ ModelInstanceState::CaptureBucket(
       catch (...) {
       }
     }
+    // capture_end() itself can throw mid-cleanup (e.g. the OOM that failed the
+    // capture) and leave the POOL STREAM still in capture mode. A later capture
+    // drawing that stream from the pool would have its setup ops captured
+    // instead of executed -- garbage inputs, repeat_interleave device-side
+    // assert, poisoned context, std::terminate from a throwing destructor, pod
+    // crashloop (2026-07-16 shadow). Verify at the raw CUDA level and force-end
+    // any dangling capture, then clear the sticky error.
+    if (capture_stream.has_value()) {
+      cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+      if (cudaStreamIsCapturing(capture_stream->stream(), &cap_status) ==
+              cudaSuccess &&
+          cap_status != cudaStreamCaptureStatusNone) {
+        cudaGraph_t dangling = nullptr;
+        cudaStreamEndCapture(capture_stream->stream(), &dangling);
+        if (dangling != nullptr) {
+          cudaGraphDestroy(dangling);
+        }
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_WARN,
+            (std::string("Force-ended a dangling stream capture after the "
+                         "failed capture of shape '") +
+             key + "'")
+                .c_str());
+      }
+    }
+    cudaGetLastError();  // reset the sticky error from the failed capture
     cuda_graph_failed_.insert(key);  // don't retry this shape (negative cache)
     c10::cuda::setCurrentCUDAStream(prev_stream);
     model_state_->CudaGraphMetricCaptureFailure(bucket);
