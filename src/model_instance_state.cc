@@ -1969,6 +1969,13 @@ ModelInstanceState::SetInputTensors(
 
 #ifdef TRITON_ENABLE_GPU
     if (prestaged_entry_ != nullptr) {
+      // Torch ops below throw C++ exceptions (e.g. cudaErrorMemoryAllocation at
+      // kernel launch when the device is at the VRAM ceiling). SetInputTensors
+      // is outside Execute's try/catch, and an escaping exception aborts the
+      // whole pod via std::unexpected (2026-07-16 shadow crashloop under
+      // traffic). Convert to a request error instead: the batch fails, the pod
+      // survives, and the client retries.
+      try {
       const int64_t r = static_cast<int64_t>(total_batch_size);
       torch::Tensor& st =
           prestaged_entry_->static_inputs[input_index_map_[info.name]];
@@ -2007,6 +2014,14 @@ ModelInstanceState::SetInputTensors(
       // Expose the r-sized view for shape derivation and eager fallback.
       (*input_tensors)[input_index_map_[info.name]] =
           st.narrow(0, 0, prefix_dim0);
+      }
+      catch (const std::exception& ex) {
+        return TRITONSERVER_ErrorNew(
+            TRITONSERVER_ERROR_INTERNAL,
+            (std::string("prestage collection failed for input '") +
+             info.name + "': " + ex.what())
+                .c_str());
+      }
       continue;
     }
 #endif
