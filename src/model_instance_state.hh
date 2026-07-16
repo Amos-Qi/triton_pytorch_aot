@@ -135,6 +135,13 @@ class ModelInstanceState : public BackendModelInstance {
   };
   std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
 
+  // One shared capture memory pool per INSTANCE: within an instance only one
+  // graph replays at a time (batches are serialized), so every bucket's
+  // intermediates can live in the same pool -- memory ~= the largest bucket
+  // instead of the sum over buckets. First capture creates the pool; the
+  // followers pass its id to capture_begin. {0,0} = not created yet.
+  at::cuda::MempoolId_t cuda_graph_mempool_{0, 0};
+
   // Negative cache: input-shape keys whose capture failed once. We go straight
   // to eager for these (no re-warmup + re-capture + graph leak on every
   // subsequent request of the same shape).

@@ -515,13 +515,19 @@ ModelInstanceState::CaptureBucket(
     }
     stream.synchronize();
 
-    // Capture. Relaxed mode matches the proven spike.
+    // Capture. Relaxed mode matches the proven spike. All of this instance's
+    // buckets share ONE memory pool (only one graph replays at a time per
+    // instance), so graph memory scales with the largest bucket, not the sum.
     graph = new at::cuda::CUDAGraph();
-    graph->capture_begin({0, 0}, cudaStreamCaptureModeRelaxed);
+    graph->capture_begin(cuda_graph_mempool_, cudaStreamCaptureModeRelaxed);
     std::vector<torch::Tensor> static_outputs =
         runner->run_with_cuda_stream(static_inputs, stream);
     graph->capture_end();
     stream.synchronize();
+
+    if (cuda_graph_mempool_ == at::cuda::MempoolId_t{0, 0}) {
+      cuda_graph_mempool_ = graph->pool();
+    }
 
     CudaGraphEntry entry{
         std::unique_ptr<at::cuda::CUDAGraph>(graph), std::move(static_inputs),
@@ -608,6 +614,9 @@ ModelInstanceState::ExecuteWithCudaGraph(
                 .c_str());
         cuda_graph_cache_.clear();
         cuda_graph_failed_.clear();
+        // The shared capture pool died with the graphs above; a fresh pool is
+        // created on the next capture.
+        cuda_graph_mempool_ = {0, 0};
         // Defensive: a prestaged pointer would dangle after clear(). It cannot
         // actually be set here (prestaging requires the batch widths to MATCH
         // the captured buffers, and this branch fires only on width mismatch),
