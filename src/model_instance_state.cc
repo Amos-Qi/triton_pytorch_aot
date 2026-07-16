@@ -1050,7 +1050,13 @@ ModelInstanceState::WarmupCudaGraphs()
        " ms added to READY time)")
           .c_str());
 
-  for (const int64_t bucket : buckets) {  // std::set iterates ascending
+  // Capture LARGEST bucket first: it sizes the shared per-instance pool at
+  // its maximum once, and every smaller bucket then fits inside existing
+  // pool blocks (big blocks split down cleanly). Ascending order grew the
+  // pool in steps and mid-sequence captures OOM-ed on fragmentation at the
+  // 6-instance watermark (R=22 failing while R=32 later succeeded).
+  for (auto b_it = buckets.rbegin(); b_it != buckets.rend(); ++b_it) {
+    const int64_t bucket = *b_it;
     try {
       // v3_q3a request-batch layout at the bucket shape (see PadRequestsUp):
       // [0] packed_single (bucket, F1), [1] packed_multiple flat
