@@ -1050,13 +1050,8 @@ ModelInstanceState::WarmupCudaGraphs()
        " ms added to READY time)")
           .c_str());
 
-  // Capture LARGEST bucket first: it sizes the shared per-instance pool at
-  // its maximum once, and every smaller bucket then fits inside existing
-  // pool blocks (big blocks split down cleanly). Ascending order grew the
-  // pool in steps and mid-sequence captures OOM-ed on fragmentation at the
-  // 6-instance watermark (R=22 failing while R=32 later succeeded).
-  for (auto b_it = buckets.rbegin(); b_it != buckets.rend(); ++b_it) {
-    const int64_t bucket = *b_it;
+  // One bucket attempt: zero-valued inputs at the bucket shape.
+  const auto attempt_bucket = [&](int64_t bucket, const char* pass_name) {
     try {
       // v3_q3a request-batch layout at the bucket shape (see PadRequestsUp):
       // [0] packed_single (bucket, F1), [1] packed_multiple flat
@@ -1083,7 +1078,7 @@ ModelInstanceState::WarmupCudaGraphs()
           TRITONSERVER_LOG_INFO,
           (std::string("CUDA-graph warmup bucket R=") + std::to_string(bucket) +
            (ok ? " captured in " : " FAILED after ") + std::to_string(ms) +
-           " ms on model instance '" + Name() + "'")
+           " ms (" + pass_name + ") on model instance '" + Name() + "'")
               .c_str());
     }
     catch (const std::exception& ex) {
@@ -1096,6 +1091,31 @@ ModelInstanceState::WarmupCudaGraphs()
            "); continuing (lazy capture is the safety net)")
               .c_str());
     }
+  };
+
+  // Capture LARGEST bucket first: it sizes the shared per-instance pool at
+  // its maximum once, and every smaller bucket then fits inside existing
+  // pool blocks (big blocks split down cleanly). Ascending order grew the
+  // pool in steps and mid-sequence captures OOM-ed on fragmentation at the
+  // 6-instance watermark (R=22 failing while R=32 later succeeded).
+  for (auto b_it = buckets.rbegin(); b_it != buckets.rend(); ++b_it) {
+    attempt_bucket(*b_it, "first pass");
+  }
+
+  // Second chance for buckets that failed above: by now this instance's pool
+  // is fully sized and the transient warmup allocations are returned
+  // (CaptureBucket empties the allocator cache before capturing), so a
+  // marginal-watermark OOM usually clears. One retry; a second failure
+  // re-enters the negative cache and pins eager for real.
+  std::vector<int64_t> retry_buckets;
+  for (const int64_t bucket : buckets) {
+    if (cuda_graph_failed_.count("R=" + std::to_string(bucket)) > 0) {
+      retry_buckets.push_back(bucket);
+    }
+  }
+  for (const int64_t bucket : retry_buckets) {
+    cuda_graph_failed_.erase("R=" + std::to_string(bucket));
+    attempt_bucket(bucket, "retry pass");
   }
 }
 #endif
