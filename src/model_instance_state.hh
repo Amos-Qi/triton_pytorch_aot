@@ -76,6 +76,13 @@ class ModelInstanceState : public BackendModelInstance {
   // graph-captured FRONT. Null unless the split is enabled.
   std::string trunk_model_path_;
   std::shared_ptr<torch::inductor::AOTIModelPackageLoader> trunk_aoti_model_;
+
+  // Capture-legal loader for CUDA-graph capture (see ModelState::LoadModel).
+  // Under weight sharing this is the shared single-threaded companion loader
+  // (constants are references to aoti_model_'s tensors); otherwise it aliases
+  // aoti_model_. Only used inside CaptureBucket, under the model-level
+  // capture mutex.
+  std::shared_ptr<torch::inductor::AOTIModelPackageLoader> capture_aoti_model_;
   torch::Device device_;
 
   // Map from configuration name for an input to the index of

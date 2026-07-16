@@ -114,12 +114,21 @@ class ModelState : public triton::backend::BackendModel {
   // Used to determine num_runners when weight sharing is enabled.
   size_t total_instance_count_;
 
-  // Model mapping for shared AOTInductor model across all instances on the
-  // same device. The key is a pair of isGPU and device index.
+  // Model mapping for shared AOTInductor models across all instances. Keyed by
+  // (artifact_name, (isGPU, device index)) so distinct artifacts of one model
+  // (e.g. the partial split's model.pt2 + model_trunk.pt2) don't collide.
   std::map<
-      std::pair<bool, int64_t>,
+      std::pair<std::string, std::pair<bool, int64_t>>,
       std::shared_ptr<torch::inductor::AOTIModelPackageLoader>>
       aoti_models_;
+  // Capture-legal (single-threaded) companions of the shared loaders, same
+  // key. Only populated in the weight-sharing + CUDA-graph mode.
+  std::map<
+      std::pair<std::string, std::pair<bool, int64_t>>,
+      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>>
+      aoti_capture_models_;
+
+  std::mutex cuda_graph_capture_mutex_;
 
   // model_outputs is a map that contains unique outputs that the model must
   // provide. The first pair is the model output index and the second is
@@ -192,10 +201,23 @@ class ModelState : public triton::backend::BackendModel {
   // is not virtual
   bool EnablePinnedInput() const;
 
+  // Load (or reuse from the sharing cache) the AOTI package `artifact_name`.
+  // When `capture_model` is non-null and CUDA graphs are enabled, it receives
+  // a capture-legal loader for the same artifact: under weight sharing this is
+  // a SECOND, single-threaded loader whose constants are user-managed
+  // references to `aoti_model`'s tensors (weights exist once; graph captures
+  // bake in the shared addresses), otherwise it aliases `aoti_model`.
   TRITONSERVER_Error* LoadModel(
       const std::string& artifact_name, const torch::Device device,
       std::string* model_path, const TRITONSERVER_InstanceGroupKind& kind,
-      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model);
+      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model,
+      std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* capture_model =
+          nullptr);
+
+  // Serializes CUDA-graph captures across instances: under weight sharing the
+  // capture loader is a single shared single-threaded container (slot 0), so
+  // concurrent captures would collide on it.
+  std::mutex& CudaGraphCaptureMutex() { return cuda_graph_capture_mutex_; }
 
   const std::map<std::string, std::pair<int64_t, int64_t>>& ModelOutputs();
 

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -87,7 +88,8 @@ ModelInstanceState::ModelInstanceState(
 #endif
 
   THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
-      ArtifactFilename(), device_, &model_path_, Kind(), &aoti_model_));
+      ArtifactFilename(), device_, &model_path_, Kind(), &aoti_model_,
+      &capture_aoti_model_));
 
   if (model_state->PartialSplit()) {
     // Partial-graph split: aoti_model_ (model.pt2) is the graph-captured
@@ -477,12 +479,18 @@ ModelInstanceState::CaptureBucket(
   // std::terminate, so we must not let it run. A capture failure is a rare
   // safety-net path (the intended static shape captures cleanly).
   at::cuda::CUDAGraph* graph = nullptr;
+  // One capture at a time model-wide: under weight sharing every instance
+  // captures through the SAME single-threaded loader (slot 0), and even
+  // per-instance loaders gain nothing from concurrent captures.
+  std::lock_guard<std::mutex> capture_lk(
+      model_state_->CudaGraphCaptureMutex());
   try {
     // Low-level CUDA runner: run_with_cuda_stream runs AOTI on the capture
     // stream (the pattern proven by the route-c de-risk spike). Requires the
-    // loader to have been built run_single_threaded (ENABLE_CUDA_GRAPH).
+    // CAPTURE loader (single-threaded; == aoti_model_ when weight sharing is
+    // off, the shared companion loader when it is on).
     auto* runner = static_cast<torch::inductor::AOTIModelContainerRunnerCuda*>(
-        aoti_model_->get_runner());
+        capture_aoti_model_->get_runner());
     if (runner == nullptr) {
       throw std::runtime_error(
           "AOTI CUDA runner unavailable (loader not run_single_threaded?)");

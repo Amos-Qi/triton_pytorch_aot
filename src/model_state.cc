@@ -377,7 +377,8 @@ TRITONSERVER_Error*
 ModelState::LoadModel(
     const std::string& artifact_name, const torch::Device device,
     std::string* model_path, const TRITONSERVER_InstanceGroupKind& kind,
-    std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model)
+    std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* aoti_model,
+    std::shared_ptr<torch::inductor::AOTIModelPackageLoader>* capture_model)
 {
   // Find the AOTInductor package file that describes the model. If the model
   // configuration doesn't have an explicit model file specified then
@@ -399,14 +400,33 @@ ModelState::LoadModel(
             "' for model instance '" + Name() + "'");
   }
 
-  // If weight sharing is enabled, skip loading model if
-  // it is already available on the target device
-  std::pair<bool, int> device_pair;
+  // Weight sharing + CUDA graphs is the dual-loader mode: a thread-safe
+  // multi-runner loader serves eager runs from every instance concurrently,
+  // and a separate single-threaded loader exists ONLY for graph capture
+  // (capture through the thread-safe run() path is illegal: its model-slot
+  // reclamation queries completion events, which errors while the stream is
+  // capturing -- pytorch/pytorch@85467ed). The capture loader's constants are
+  // user-managed references to the serve loader's tensors, so the weights
+  // exist ONCE and the captured graphs read the same addresses eager does.
+  const bool dual_capture_mode =
+      enable_weight_sharing_ && enable_cuda_graph_ && !device.is_cpu();
+
+  // If weight sharing is enabled, skip loading model if it is already
+  // available on the target device. Keyed by artifact too, so distinct
+  // artifacts of one model (partial split) don't collide.
+  std::pair<std::string, std::pair<bool, int64_t>> cache_key;
   if (enable_weight_sharing_) {
-    device_pair = std::make_pair(!device.is_cpu(), device.index());
-    auto mit = aoti_models_.find(device_pair);
+    cache_key = std::make_pair(
+        cc_model_filename,
+        std::make_pair(!device.is_cpu(), (int64_t)device.index()));
+    auto mit = aoti_models_.find(cache_key);
     if (mit != aoti_models_.end()) {
       *aoti_model = mit->second;
+      if (capture_model != nullptr) {
+        auto cit = aoti_capture_models_.find(cache_key);
+        *capture_model =
+            (cit != aoti_capture_models_.end()) ? cit->second : *aoti_model;
+      }
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
           (std::string("Reusing AOTInductor model for instance '") + Name() +
@@ -420,6 +440,7 @@ ModelState::LoadModel(
   // model loading: https://pytorch.org/cppdocs/notes/inference_mode.html
   torch::InferenceMode infer_guard(EnabledInferenceMode());
 
+  std::shared_ptr<torch::inductor::AOTIModelPackageLoader> capture_loader;
   try {
     // Determine the device index for AOTInductor
     int device_index = -1;  // Default for CPU or auto-selection
@@ -430,14 +451,12 @@ ModelState::LoadModel(
     // When weight sharing is enabled, use num_runners equal to the instance
     // count to allow concurrent inference from all instances sharing the model.
     size_t num_runners = enable_weight_sharing_ ? total_instance_count_ : 1;
+    bool run_single_threaded = false;
 
-    // CUDA-graph capture requires the loader to run single-threaded (one
-    // runner, no worker-thread stream join) -- otherwise capture fails with
-    // "operation not permitted when stream is capturing"
-    // (pytorch/pytorch@85467ed). This overrides weight sharing's multi-runner
-    // setting for the graph path.
-    const bool run_single_threaded = enable_cuda_graph_;
-    if (enable_cuda_graph_) {
+    if (enable_cuda_graph_ && !dual_capture_mode) {
+      // No sharing: the ONE loader doubles as the capture loader, so it must
+      // be single-threaded (see the dual-mode comment above).
+      run_single_threaded = true;
       num_runners = 1;
     }
 
@@ -452,6 +471,36 @@ ModelState::LoadModel(
          "' with " + std::to_string(num_runners) + " runner(s)" +
          " for instance '" + Name() + "'")
             .c_str());
+
+    if (dual_capture_mode && capture_model != nullptr) {
+      // Second, capture-legal loader for the same artifact. Constructing it
+      // loads its own constants first (a transient duplicate at load time);
+      // load_constants(user_managed=true) then rebinds them to the serve
+      // loader's tensors and releases the copies.
+      capture_loader.reset(new torch::inductor::AOTIModelPackageLoader(
+          *model_path, "model", /*run_single_threaded=*/true,
+          /*num_runners=*/1, device_index));
+
+      auto* serve_runner = (*aoti_model)->get_runner();
+      const auto extracted =
+          serve_runner->extract_constants_map(/*use_inactive=*/false);
+      std::unordered_map<std::string, at::Tensor> shared_constants(
+          extracted.begin(), extracted.end());
+      // check_full_update=false: extract skips constants produced by constant
+      // folding; the capture loader folds its own from the shared originals
+      // on its first (warmup) run.
+      capture_loader->load_constants(
+          shared_constants, /*use_inactive=*/false,
+          /*check_full_update=*/false, /*user_managed=*/true);
+
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Weight-shared capture loader ready for '") +
+           *model_path + "': " + std::to_string(shared_constants.size()) +
+           " constants rebound to the serve loader's tensors for instance '" +
+           Name() + "'")
+              .c_str());
+    }
   }
   catch (const std::exception& ex) {
     return TRITONSERVER_ErrorNew(
@@ -460,14 +509,21 @@ ModelState::LoadModel(
             .c_str());
   }
 
+  if (capture_model != nullptr) {
+    *capture_model = (capture_loader != nullptr) ? capture_loader : *aoti_model;
+  }
+
   if (enable_weight_sharing_) {
-    if (!((aoti_models_.emplace(device_pair, *aoti_model)).second)) {
+    if (!((aoti_models_.emplace(cache_key, *aoti_model)).second)) {
       std::string type = device.is_cpu() ? "CPU" : "GPU";
       LOG_MESSAGE(
           TRITONSERVER_LOG_WARN,
           (std::string("Model already found on target ") + type + " device " +
            "(id " + std::to_string(device.index()) + ") for '" + Name() + "'")
               .c_str());
+    }
+    if (capture_loader != nullptr) {
+      aoti_capture_models_.emplace(cache_key, capture_loader);
     }
   }
 
@@ -598,21 +654,17 @@ ModelState::ParseParameters()
       }
     }
 
-    // Self-protecting override: capture/replay needs a single-runner
-    // (run_single_threaded, num_runners=1) loader per instance. Weight sharing
-    // would reuse ONE such loader across all instances (LoadModel: reuse
-    // ~229-241, register ~286-294), racing their captures/replays -- so force
-    // it off. ParseParameters runs at model init (before any LoadModel), so
-    // this override is effective; LoadModel itself is unchanged.
+    // Weight sharing + CUDA graphs run in the dual-loader mode (see
+    // LoadModel): a thread-safe multi-runner serve loader shared by all
+    // instances plus one single-threaded capture loader whose constants are
+    // user-managed references to the serve loader's tensors. Captures are
+    // serialized by CudaGraphCaptureMutex(); graphs/replays stay per-instance.
     if (enable_cuda_graph_ && enable_weight_sharing_) {
-      enable_weight_sharing_ = false;
       LOG_MESSAGE(
-          TRITONSERVER_LOG_WARN,
-          (std::string(
-               "ENABLE_CUDA_GRAPH=true forces ENABLE_WEIGHT_SHARING off (was "
-               "ENABLE_WEIGHT_SHARING=true): each cudagraph instance needs its "
-               "own single-runner loader + per-instance graph cache, for model "
-               "instance '") +
+          TRITONSERVER_LOG_INFO,
+          (std::string("ENABLE_CUDA_GRAPH + ENABLE_WEIGHT_SHARING: dual-loader "
+                       "mode (shared weights, serialized captures) for model "
+                       "instance '") +
            Name() + "'")
               .c_str());
     }
@@ -731,17 +783,6 @@ ModelState::ParseParameters()
              std::to_string(partial_split_multi_row_width_) +
              " multi_width=" + std::to_string(cuda_graph_warmup_multi_width_) +
              " for model '" + Name() + "'")
-                .c_str());
-      }
-      if (enable_weight_sharing_) {
-        // LoadModel's shared-loader cache is keyed by device only; the front
-        // and trunk loaders would collide in it.
-        enable_weight_sharing_ = false;
-        LOG_MESSAGE(
-            TRITONSERVER_LOG_WARN,
-            (std::string("PARTIAL_SPLIT forces ENABLE_WEIGHT_SHARING off for "
-                         "model instance '") +
-             Name() + "'")
                 .c_str());
       }
     }
