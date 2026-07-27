@@ -342,8 +342,12 @@ run.
     one graph per first-seen REQUEST COUNT (the cache is keyed by `R` only),
     at whatever input widths that `R` first arrived with — if widths later
     change for the same `R`, no new graph is captured; the one-time warmup
-    width self-heal is the only protection. Only use this when both the
-    request-count universe and the input widths are known to be fixed.
+    width self-heal is the only protection. The failure mode is performance,
+    not correctness: a width-mismatched batch fails the replay-time copy and
+    falls back to eager (WARN + `cudagraph_eager_fallbacks_total`), so that
+    `R` effectively goes permanently eager rather than serving wrong results.
+    Only use this mode when both the request-count universe and the input
+    widths are known to be fixed.
   * **A present but malformed or empty value fails model load** (the
     parameter's presence declares the intent to bound capture; silently
     falling back to unbounded would invert the meaning). Every non-empty
