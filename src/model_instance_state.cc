@@ -410,6 +410,33 @@ ModelInstanceState::GetCudaStreamByInstanceKind()
 }
 
 #ifdef TRITON_ENABLE_GPU
+bool
+ModelInstanceState::HasV3RequestBatchLayout()
+{
+  if (v3_layout_state_ == 0) {
+    const auto at_index = [&](const char* name, int idx) {
+      const auto it = input_index_map_.find(name);
+      return (it != input_index_map_.end()) && (it->second == idx);
+    };
+    v3_layout_state_ = (at_index("packed_single_batch_tensor", 0) &&
+                        at_index("packed_multiple_batch_tensor", 1) &&
+                        at_index("request_end_position", 2))
+                           ? 1
+                           : -1;
+    if (v3_layout_state_ != 1 && model_state_->EnabledCudaGraph()) {
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_INFO,
+          (std::string("Model instance '") + Name() +
+           "' does not expose the canonical request-batch layout "
+           "(packed_single/packed_multiple/request_end_position at inputs "
+           "0/1/2); CUDA graphs will replay exact-R shapes only (no bucket "
+           "padding, no load-time warmup)")
+              .c_str());
+    }
+  }
+  return v3_layout_state_ == 1;
+}
+
 std::string
 ModelInstanceState::InputShapeKey(
     const std::vector<torch::Tensor>& inputs) const
@@ -440,6 +467,14 @@ ModelInstanceState::PadRequestsUp(
   // wrong).
   std::vector<torch::Tensor> out;
   out.reserve(inputs.size());
+  // Callers guarantee these (r>0 eager-fallback guard + the canonical-layout
+  // gate + the ragged-uniformity gate in ExecuteWithCudaGraph); a violation
+  // here would corrupt the padded batch, so fail the request instead.
+  TORCH_CHECK(
+      r > 0 && bucket >= r && inputs.size() == 3 &&
+          inputs[1].numel() % r == 0 && inputs[0].size(0) % r == 0,
+      "PadRequestsUp preconditions violated (r=", r, ", bucket=", bucket,
+      ", inputs=", inputs.size(), ")");
   const int64_t per =
       inputs[1].numel() /
       r;  // elements/request (uniform: candidates padded to bucket)
@@ -620,6 +655,14 @@ ModelInstanceState::ExecuteWithCudaGraph(
   for (const auto& t : *input_tensors) {
     r = std::min<int64_t>(r, t.size(0));
   }
+  // Degenerate batch (e.g. an empty ragged input -> a 0-sized leading dim):
+  // nothing can replay at R=0, and the per-request width math below divides
+  // by r (a plain integer division -- r=0 would be fatal, not an exception).
+  // Run it eager.
+  if (r <= 0) {
+    model_state_->CudaGraphMetricEagerFallback();
+    return false;
+  }
 
   // One-time width self-heal: warmup captured graphs at the configured widths
   // (CUDA_GRAPH_WARMUP_*_WIDTH). The cache is keyed only by "R=<bucket>", so if
@@ -733,6 +776,12 @@ ModelInstanceState::ExecuteWithCudaGraph(
       std::vector<torch::Tensor> cand_padded;
       const std::vector<torch::Tensor>* cand_inputs = input_tensors;
       if (cand != r) {
+        if (!HasV3RequestBatchLayout()) {
+          // Padding rewrites input[2] as a per-request cumsum -- only defined
+          // for the canonical layout. The set is ascending, so every later
+          // bucket also needs padding: stop here and run eager.
+          break;
+        }
         cand_padded = PadRequestsUp(*input_tensors, r, cand);
         cand_inputs = &cand_padded;
       }
@@ -1036,6 +1085,11 @@ ModelInstanceState::FindReadyCudaGraphEntry(int64_t r, int64_t* bucket_out)
     if (cuda_graph_failed_.find(key) != cuda_graph_failed_.end()) {
       continue;
     }
+    if (*b_it != r && !HasV3RequestBatchLayout()) {
+      // The slow path never pads without the canonical layout (it goes eager
+      // at the first bucket that would need padding); mirror that here.
+      return nullptr;
+    }
     auto it = cuda_graph_cache_.find(key);
     if (it == cuda_graph_cache_.end()) {
       // The slow path would capture-on-first-use at THIS bucket; defer to it
@@ -1061,6 +1115,20 @@ ModelInstanceState::WarmupCudaGraphs()
         model_state_->CudaGraphWarmupSingleWidth() > 0 &&
         model_state_->CudaGraphWarmupMultiWidth() > 0 &&
         !model_state_->CudaGraphBatchSizes().empty())) {
+    return;
+  }
+  // The synthetic zero inputs below are the canonical request-batch layout.
+  // Capturing them against any other model would fail every bucket and the
+  // negative cache would then pin those buckets to eager permanently --
+  // skip warmup instead (lazy capture handles the model's real shapes).
+  if (!HasV3RequestBatchLayout()) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        (std::string("CUDA-graph warmup skipped for model instance '") +
+         Name() +
+         "': warmup widths are configured but the model does not expose the "
+         "canonical request-batch layout")
+            .c_str());
     return;
   }
 

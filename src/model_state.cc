@@ -424,8 +424,23 @@ ModelState::LoadModel(
       *aoti_model = mit->second;
       if (capture_model != nullptr) {
         auto cit = aoti_capture_models_.find(cache_key);
-        *capture_model =
-            (cit != aoti_capture_models_.end()) ? cit->second : *aoti_model;
+        if (cit != aoti_capture_models_.end()) {
+          *capture_model = cit->second;
+        } else if (dual_capture_mode) {
+          // The multi-runner serve loader is capture-ILLEGAL (its model-slot
+          // reclamation errors while a stream is capturing); handing it out
+          // as the capture loader would fail every capture at runtime. The
+          // companion is always cached with the serve loader on first load,
+          // so this indicates a load-order bug -- fail loudly.
+          return TRITONSERVER_ErrorNew(
+              TRITONSERVER_ERROR_INTERNAL,
+              (std::string("weight-sharing capture companion missing from "
+                           "the loader cache for '") +
+               Name() + "'")
+                  .c_str());
+        } else {
+          *capture_model = *aoti_model;
+        }
       }
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
@@ -453,7 +468,16 @@ ModelState::LoadModel(
     size_t num_runners = enable_weight_sharing_ ? total_instance_count_ : 1;
     bool run_single_threaded = false;
 
-    if (enable_cuda_graph_ && !dual_capture_mode) {
+    if (enable_cuda_graph_ && device.is_cpu()) {
+      // CUDA graphs cannot exist on a CPU instance; the instance runs the
+      // normal eager path. Don't degrade its loader to single-threaded.
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string("ENABLE_CUDA_GRAPH is set but instance '") + Name() +
+           "' runs on CPU; CUDA graphs are disabled for it (eager run, "
+           "default threading)")
+              .c_str());
+    } else if (enable_cuda_graph_ && !dual_capture_mode) {
       // No sharing: the ONE loader doubles as the capture loader, so it must
       // be single-threaded (see the dual-mode comment above).
       run_single_threaded = true;
@@ -645,6 +669,26 @@ ModelState::ParseParameters()
           TRITONSERVER_ErrorDelete(serr);
         } else {
           cuda_graph_batch_sizes_ = ParseCsvInt64Set(val);
+          // Drop entries no real batch can ever match: non-positive values
+          // (warmup would try to capture at them) and values above
+          // max_batch_size (the scheduler never forms such batches; their
+          // graphs would only waste capture time + VRAM).
+          const int64_t max_bs = static_cast<int64_t>(MaxBatchSize());
+          for (auto b_it = cuda_graph_batch_sizes_.begin();
+               b_it != cuda_graph_batch_sizes_.end();) {
+            if (*b_it <= 0 || (max_bs > 0 && *b_it > max_bs)) {
+              LOG_MESSAGE(
+                  TRITONSERVER_LOG_WARN,
+                  (std::string("Ignoring CUDA_GRAPH_BATCH_SIZES entry ") +
+                   std::to_string(*b_it) + " for model '" + Name() +
+                   "' (must be in [1, max_batch_size=" +
+                   std::to_string(max_bs) + "])")
+                      .c_str());
+              b_it = cuda_graph_batch_sizes_.erase(b_it);
+            } else {
+              ++b_it;
+            }
+          }
           LOG_MESSAGE(
               TRITONSERVER_LOG_INFO,
               (std::string("CUDA graph R buckets: '") + val +

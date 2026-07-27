@@ -154,6 +154,10 @@ class ModelInstanceState : public BackendModelInstance {
   // not by width).
   bool warmup_widths_checked_ = false;
 
+  // Tri-state cache for HasV3RequestBatchLayout(): 0 = not checked yet,
+  // 1 = the model exposes the canonical request-batch layout, -1 = it doesn't.
+  int v3_layout_state_ = 0;
+
   // Input prestaging (per-batch state; Triton runs batches serially per
   // instance). When SetInputTensors finds an already-captured bucket whose
   // widths match the incoming batch, it collects the request payloads DIRECTLY
@@ -222,6 +226,15 @@ class ModelInstanceState : public BackendModelInstance {
   cudaStream_t GetCudaStreamByInstanceKind();
 
 #ifdef TRITON_ENABLE_GPU
+  // Whether the model exposes the canonical request-batch layout:
+  // packed_single_batch_tensor / packed_multiple_batch_tensor /
+  // request_end_position at input indices 0/1/2. PadRequestsUp (and the
+  // warmup's synthetic zero inputs) rewrite input[2] as a per-request cumsum,
+  // which is only meaningful for this layout -- any other model replays
+  // exact-R shapes only and never pads. Cached after the first call
+  // (input_index_map_ is final after ValidateInputs).
+  bool HasV3RequestBatchLayout();
+
   // Build a stable key from the input tensor shapes for the CUDA-graph cache.
   std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
 
