@@ -49,6 +49,7 @@
 #endif  // TRITON_PYTORCH_ENABLE_TORCHVISION
 
 #ifdef TRITON_ENABLE_GPU
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>
@@ -531,6 +532,17 @@ ModelInstanceState::CaptureBucket(
     c10::cuda::CUDAStream stream =
         c10::cuda::getStreamFromPool(/*isHighPriority=*/false, device_.index());
     capture_stream = stream;
+    // The inputs were produced on the CALLER's stream (the default stream for
+    // warmup synthetics, the instance stream for a live padded batch); the
+    // clones below read them on the capture stream. Order the two streams or
+    // the clone can read not-yet-written memory -- observed live as an
+    // all-zero request_end_position baked into a warmup capture, whose
+    // repeat_interleave then device-asserted and killed the process at load.
+    {
+      at::cuda::CUDAEvent inputs_ready;
+      inputs_ready.record(prev_stream);
+      inputs_ready.block(stream);
+    }
     c10::cuda::setCurrentCUDAStream(stream);
 
     // Fixed-address input buffers (the graph replays into the same addresses),
