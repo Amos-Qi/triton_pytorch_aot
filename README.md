@@ -300,6 +300,140 @@ Triton exposes some flags to control the execution mode of AOTInductor models th
   }
   ```
 
+### CUDA Graph Capture/Replay
+
+For static-shape AOTInductor models, the backend can capture the whole forward
+pass into CUDA graphs (one per request-batch size "bucket") and replay them,
+eliminating per-launch CPU overhead. Requests are collected into fixed static
+input buffers, the batch is padded up to the nearest captured bucket, the graph
+replays, and each output's batch dimension is sliced back to the real request
+count. Any batch that cannot replay (shape outside the buckets, capture
+failure, degenerate inputs) transparently falls back to the eager AOTInductor
+run.
+
+* `ENABLE_CUDA_GRAPH`:
+
+  Boolean flag to enable CUDA-graph capture/replay.
+  If not specified, CUDA graphs are disabled and the eager path is unchanged.
+
+  Enabling this builds the AOTInductor loader single-threaded with one runner
+  (capture through a multi-runner loader is illegal), and forces
+  `ENABLE_WEIGHT_SHARING` off: every instance needs its own single-runner
+  loader and keeps its own captured graphs. On a CPU instance the flag is
+  ignored with a warning (eager run, default threading).
+
+  ```proto
+  parameters: {
+    key: "ENABLE_CUDA_GRAPH"
+    value: { string_value: "true" }
+  }
+  ```
+
+* `CUDA_GRAPH_BATCH_SIZES`:
+
+  Comma-separated list of request-batch sizes (buckets) to capture graphs at,
+  e.g. `"2,4,6"`. A batch of size `r` replays the smallest captured bucket
+  `>= r` (padded with inert dummy requests whose output rows are discarded);
+  `r` above the largest bucket runs eager.
+
+  Semantics that matter:
+
+  * **Omitting the parameter enables unbounded capture**: the backend captures
+    one graph per first-seen input shape, with no cap on how many. Only use
+    this when the shape universe is known to be tiny.
+  * **A present but malformed or empty value fails model load** (the
+    parameter's presence declares the intent to bound capture; silently
+    falling back to unbounded would invert the meaning). Every non-empty
+    token must parse fully as an integer.
+  * Entries outside `[1, max_batch_size]` are dropped with a warning; if that
+    leaves the list empty, model load fails.
+  * Bucket padding (and load-time warmup) only engage for models exposing the
+    request-batch layout convention below; other models replay exact-size
+    shapes only.
+
+  ```proto
+  parameters: {
+    key: "CUDA_GRAPH_BATCH_SIZES"
+    value: { string_value: "2,4,6" }
+  }
+  ```
+
+* `CUDA_GRAPH_WARMUP_SINGLE_WIDTH` / `CUDA_GRAPH_WARMUP_MULTI_WIDTH`:
+
+  Feature widths used to build synthetic zero-valued inputs so every
+  configured bucket is captured at model load, BEFORE the instance goes READY
+  (roughly 15-50 ms per bucket per instance). `SINGLE_WIDTH` is the
+  per-request column count of the dense (single) input; `MULTI_WIDTH` is the
+  per-request element count of the flattened ragged (multi) input.
+
+  Both must be set (and a non-empty `CUDA_GRAPH_BATCH_SIZES` configured) or
+  warmup is skipped and each bucket captures lazily on its first live request
+  — captures run ~150 ms and flush the CUDA allocator cache, so lazy capture
+  under production traffic is a latency cliff. If the configured widths do not
+  match real traffic, the warmup captures are evicted on the first request and
+  lazy capture self-heals at the true shape.
+
+  ```proto
+  parameters: {
+    key: "CUDA_GRAPH_WARMUP_SINGLE_WIDTH"
+    value: { string_value: "2756" }
+  }
+  parameters: {
+    key: "CUDA_GRAPH_WARMUP_MULTI_WIDTH"
+    value: { string_value: "157696" }
+  }
+  ```
+
+#### Request-batch layout convention
+
+Bucket padding rewrites the third input as a per-request cumulative element
+count, which is only meaningful for models declaring exactly this layout:
+
+| index | input name | shape |
+|---|---|---|
+| 0 | `packed_single_batch_tensor` | `(R, single_width)` |
+| 1 | `packed_multiple_batch_tensor` | flattened ragged, `(R * multi_width,)` |
+| 2 | `request_end_position` | `(R,)` accumulated element counts (batch input) |
+
+Models that do not match this convention still get exact-size graph replay,
+but never padding or load-time warmup. For such models an empty ragged
+request is also rejected with `INVALID_ARG` before reaching the model: an
+empty request otherwise trips a device-side assert inside the model that
+poisons the CUDA context (the server keeps answering readiness while every
+inference fails). The whole batch receives the error — a retryable failure,
+unlike a bricked instance.
+
+#### Metrics
+
+When CUDA graphs are enabled the backend registers four Prometheus counters
+(no-ops if the metrics API is unavailable):
+
+| metric | labels | meaning |
+|---|---|---|
+| `cudagraph_replays_total` | `bucket` | successful graph replays |
+| `cudagraph_pad_waste_rows_total` | `bucket` | dummy (padding) request rows replayed |
+| `cudagraph_eager_fallbacks_total` | — | requests served eager instead of by a graph |
+| `cudagraph_capture_failures_total` | `bucket` | failed capture attempts |
+
+A healthy steady state is a high replay rate, near-zero eager fallbacks, and
+zero capture failures after load.
+
+#### Operational notes
+
+* All of an instance's buckets share one capture memory pool, so graph memory
+  scales with the largest bucket rather than the sum.
+* Before each capture the backend calls
+  `CUDACachingAllocator::emptyCache()` — a process-global cache flush with a
+  device sync. This is what lets many instances' pools co-exist on one
+  device, but in a multi-model server it briefly affects other models on the
+  process; captures are also serialized model-wide for the same reason.
+  Captures happen at load (warmup) or rarely (lazy/self-heal), so the impact
+  window is small.
+* A failed capture intentionally leaks the partial `at::cuda::CUDAGraph`
+  object: its destructor can throw after a failed capture, which would
+  terminate the process. The failure is negative-cached (the bucket pins to
+  eager), so the leak is bounded to one object per failed bucket.
+
 ### Model Instance Group Kind
 
 The PyTorch backend supports the following kinds of

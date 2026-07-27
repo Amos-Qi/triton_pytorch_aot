@@ -234,6 +234,12 @@ TRITONBACKEND_ModelInstanceExecute(
          ex.what())
             .c_str());
   }
+  catch (...) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_ERROR,
+        "ProcessRequests escaped a non-std exception (contained at the "
+        "backend boundary)");
+  }
 
   return nullptr;  // success
 };

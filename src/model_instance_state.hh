@@ -141,9 +141,9 @@ class ModelInstanceState : public BackendModelInstance {
   // not by width).
   bool warmup_widths_checked_ = false;
 
-  // Tri-state cache for HasV3RequestBatchLayout(): 0 = not checked yet,
+  // Tri-state cache for HasRequestBatchLayout(): 0 = not checked yet,
   // 1 = the model exposes the canonical request-batch layout, -1 = it doesn't.
-  int v3_layout_state_ = 0;
+  int request_batch_layout_state_ = 0;
 
   // Input prestaging (per-batch state; Triton runs batches serially per
   // instance). When SetInputTensors finds an already-captured bucket whose
@@ -206,7 +206,7 @@ class ModelInstanceState : public BackendModelInstance {
   // which is only meaningful for this layout -- any other model replays
   // exact-R shapes only and never pads. Cached after the first call
   // (input_index_map_ is final after ValidateInputs).
-  bool HasV3RequestBatchLayout();
+  bool HasRequestBatchLayout();
 
   // Build a stable key from the input tensor shapes for the CUDA-graph cache.
   std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
@@ -266,7 +266,14 @@ class ModelInstanceState : public BackendModelInstance {
       NamingConvention* naming_convention,
       const std::vector<std::string>& allowed_io);
 
+  // Thin containment wrapper over ReadOutputTensorsImpl: converts escaping
+  // exceptions into a request error (this is called outside Execute's
+  // try/catch, one frame below the extern "C" boundary).
   TRITONSERVER_Error* ReadOutputTensors(
+      size_t total_batch_size, const std::vector<torch::Tensor>& output_tensors,
+      TRITONBACKEND_Request** requests, const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>* responses);
+  TRITONSERVER_Error* ReadOutputTensorsImpl(
       size_t total_batch_size, const std::vector<torch::Tensor>& output_tensors,
       TRITONBACKEND_Request** requests, const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses);
@@ -279,7 +286,15 @@ class ModelInstanceState : public BackendModelInstance {
   void SetCurrentCudaStream(
       const cudaStream_t& stream, const int32_t& device_id);
 
+  // Thin containment wrapper over SetInputTensorsImpl (same rationale as
+  // ReadOutputTensors).
   TRITONSERVER_Error* SetInputTensors(
+      size_t total_batch_size, TRITONBACKEND_Request** requests,
+      const uint32_t request_count,
+      std::vector<TRITONBACKEND_Response*>* responses,
+      BackendInputCollector* collector, std::vector<const char*>* input_names,
+      std::vector<torch::Tensor>* input_tensors, bool* cuda_copy);
+  TRITONSERVER_Error* SetInputTensorsImpl(
       size_t total_batch_size, TRITONBACKEND_Request** requests,
       const uint32_t request_count,
       std::vector<TRITONBACKEND_Response*>* responses,

@@ -404,19 +404,20 @@ ModelInstanceState::GetCudaStreamByInstanceKind()
 
 #ifdef TRITON_ENABLE_GPU
 bool
-ModelInstanceState::HasV3RequestBatchLayout()
+ModelInstanceState::HasRequestBatchLayout()
 {
-  if (v3_layout_state_ == 0) {
+  if (request_batch_layout_state_ == 0) {
     const auto at_index = [&](const char* name, int idx) {
       const auto it = input_index_map_.find(name);
       return (it != input_index_map_.end()) && (it->second == idx);
     };
-    v3_layout_state_ = (at_index("packed_single_batch_tensor", 0) &&
-                        at_index("packed_multiple_batch_tensor", 1) &&
-                        at_index("request_end_position", 2))
-                           ? 1
-                           : -1;
-    if (v3_layout_state_ != 1 && model_state_->EnabledCudaGraph()) {
+    request_batch_layout_state_ =
+        (at_index("packed_single_batch_tensor", 0) &&
+         at_index("packed_multiple_batch_tensor", 1) &&
+         at_index("request_end_position", 2))
+            ? 1
+            : -1;
+    if (request_batch_layout_state_ != 1 && model_state_->EnabledCudaGraph()) {
       LOG_MESSAGE(
           TRITONSERVER_LOG_INFO,
           (std::string("Model instance '") + Name() +
@@ -427,7 +428,7 @@ ModelInstanceState::HasV3RequestBatchLayout()
               .c_str());
     }
   }
-  return v3_layout_state_ == 1;
+  return request_batch_layout_state_ == 1;
 }
 
 std::string
@@ -451,7 +452,7 @@ std::vector<torch::Tensor>
 ModelInstanceState::PadRequestsUp(
     const std::vector<torch::Tensor>& inputs, int64_t r, int64_t bucket) const
 {
-  // v3_q3a request-batch layout: [0] packed_single (R, F1), [1] packed_multiple
+  // request-batch layout: [0] packed_single (R, F1), [1] packed_multiple
   // flat (R*per,), [2] request_end_position (R,) = cumsum of per-request
   // element counts. Pad R -> bucket by appending zero rows to the packed
   // tensors (dummy requests are inert -- candidate queries attend only to their
@@ -514,8 +515,7 @@ ModelInstanceState::CaptureBucket(
   // One capture at a time model-wide: concurrent captures gain nothing (each
   // instance keeps its own graphs) and their transient warmup allocations +
   // cache flushes race the VRAM margin captures need on a packed device.
-  std::lock_guard<std::mutex> capture_lk(
-      model_state_->CudaGraphCaptureMutex());
+  std::lock_guard<std::mutex> capture_lk(model_state_->CudaGraphCaptureMutex());
   try {
     // Low-level CUDA runner: run_with_cuda_stream runs AOTI on the capture
     // stream (the pattern proven by the route-c de-risk spike). Requires the
@@ -597,8 +597,8 @@ ModelInstanceState::CaptureBucket(
     // drawing that stream from the pool would have its setup ops captured
     // instead of executed -- garbage inputs, device-side asserts, poisoned
     // context, std::terminate from a throwing destructor, pod crashloop
-    // (2026-07-16 shadow). Verify at the raw CUDA level and force-end any
-    // dangling capture, then clear the sticky error.
+    // (observed as a live crashloop). Verify at the raw CUDA level and
+    // force-end any dangling capture, then clear the sticky error.
     if (capture_stream.has_value()) {
       cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
       if (cudaStreamIsCapturing(capture_stream->stream(), &cap_status) ==
@@ -635,7 +635,7 @@ ModelInstanceState::ExecuteWithCudaGraph(
     std::vector<torch::Tensor>* input_tensors,
     std::vector<torch::Tensor>* output_tensors)
 {
-  // Only the v3_q3a 3-input request-batch layout is R-bucketed; any other
+  // Only the 3-input request-batch layout is R-bucketed; any other
   // layout -> eager.
   if (input_tensors->size() != 3) {
     model_state_->CudaGraphMetricEagerFallback();
@@ -755,7 +755,7 @@ ModelInstanceState::ExecuteWithCudaGraph(
       std::vector<torch::Tensor> cand_padded;
       const std::vector<torch::Tensor>* cand_inputs = input_tensors;
       if (cand != r) {
-        if (!HasV3RequestBatchLayout()) {
+        if (!HasRequestBatchLayout()) {
           // Padding rewrites input[2] as a per-request cumsum -- only defined
           // for the canonical layout. The set is ascending, so every later
           // bucket also needs padding: stop here and run eager.
@@ -878,7 +878,7 @@ ModelInstanceState::FindReadyCudaGraphEntry(int64_t r, int64_t* bucket_out)
     if (cuda_graph_failed_.find(key) != cuda_graph_failed_.end()) {
       continue;
     }
-    if (*b_it != r && !HasV3RequestBatchLayout()) {
+    if (*b_it != r && !HasRequestBatchLayout()) {
       // The slow path never pads without the canonical layout (it goes eager
       // at the first bucket that would need padding); mirror that here.
       return nullptr;
@@ -914,7 +914,7 @@ ModelInstanceState::WarmupCudaGraphs()
   // Capturing them against any other model would fail every bucket and the
   // negative cache would then pin those buckets to eager permanently --
   // skip warmup instead (lazy capture handles the model's real shapes).
-  if (!HasV3RequestBatchLayout()) {
+  if (!HasRequestBatchLayout()) {
     LOG_MESSAGE(
         TRITONSERVER_LOG_WARN,
         (std::string("CUDA-graph warmup skipped for model instance '") +
@@ -944,7 +944,7 @@ ModelInstanceState::WarmupCudaGraphs()
   // One bucket attempt: zero-valued inputs at the bucket shape.
   const auto attempt_bucket = [&](int64_t bucket, const char* pass_name) {
     try {
-      // v3_q3a request-batch layout at the bucket shape (see PadRequestsUp):
+      // request-batch layout at the bucket shape (see PadRequestsUp):
       // [0] packed_single (bucket, F1), [1] packed_multiple flat
       // (bucket*multi,), [2] request_end_position (bucket,) = cumsum of
       // per-request element counts.
@@ -1392,7 +1392,7 @@ ModelInstanceState::ProcessRequests(
     }
   }
 
-  // We don't need an explicit CUDA syncrhonization here since we have already
+  // We don't need an explicit CUDA synchronization here since we have already
   // synchronized the stream in the ReadOutputTensors function.
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
 #ifdef TRITON_ENABLE_GPU
@@ -1448,12 +1448,28 @@ ModelInstanceState::ReadOutputTensors(
     TRITONBACKEND_Request** requests, const uint32_t request_count,
     std::vector<TRITONBACKEND_Response*>* responses)
 {
+  // Thin containment wrapper -- same rationale as SetInputTensors: this runs
+  // outside Execute's try/catch and must not let torch/responder exceptions
+  // escape to the extern "C" boundary.
+  try {
+    return ReadOutputTensorsImpl(
+        total_batch_size, output_tensors, requests, request_count, responses);
+  }
+  catch (const std::exception& ex) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("output processing failed: ") + ex.what()).c_str());
+  }
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::ReadOutputTensorsImpl(
+    size_t total_batch_size, const std::vector<torch::Tensor>& output_tensors,
+    TRITONBACKEND_Request** requests, const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>* responses)
+{
   NVTX_RANGE(nvtx_, "ReadOutputTensors " + Name());
 
-  // Same containment rationale as SetInputTensors: this runs outside
-  // Execute's try/catch and must not let torch/responder exceptions escape
-  // to the extern "C" boundary.
-  try {
   bool use_pinned_input = model_state_->EnablePinnedInput();
   BackendOutputResponder responder(
       requests, request_count, responses, model_state_->TritonMemoryManager(),
@@ -1566,12 +1582,6 @@ ModelInstanceState::ReadOutputTensors(
 #endif
 
   return nullptr;
-  }
-  catch (const std::exception& ex) {
-    return TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_INTERNAL,
-        (std::string("output processing failed: ") + ex.what()).c_str());
-  }
 }
 
 TRITONSERVER_Error*
@@ -1615,12 +1625,32 @@ ModelInstanceState::SetInputTensors(
     BackendInputCollector* collector, std::vector<const char*>* input_names,
     std::vector<torch::Tensor>* input_tensors, bool* cuda_copy)
 {
-  // Torch ops in here throw C++ exceptions (allocation failures foremost).
-  // This function runs OUTSIDE Execute's try/catch, and an exception escaping
-  // ProcessRequests crosses the extern "C" boundary -> std::terminate -> pod
-  // crash (the 2026-07-16 shadow crashloop was this class). Contain everything
-  // as a request error instead.
+  // Thin containment wrapper: torch ops in the implementation throw C++
+  // exceptions (allocation failures foremost), this runs OUTSIDE Execute's
+  // try/catch, and an exception escaping ProcessRequests crosses the
+  // extern "C" boundary -> std::terminate, killing the whole server (a live
+  // serving crashloop was exactly this class). Contain everything as a
+  // request error instead.
   try {
+    return SetInputTensorsImpl(
+        total_batch_size, requests, request_count, responses, collector,
+        input_names, input_tensors, cuda_copy);
+  }
+  catch (const std::exception& ex) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("input collection failed: ") + ex.what()).c_str());
+  }
+}
+
+TRITONSERVER_Error*
+ModelInstanceState::SetInputTensorsImpl(
+    size_t total_batch_size, TRITONBACKEND_Request** requests,
+    const uint32_t request_count,
+    std::vector<TRITONBACKEND_Response*>* responses,
+    BackendInputCollector* collector, std::vector<const char*>* input_names,
+    std::vector<torch::Tensor>* input_tensors, bool* cuda_copy)
+{
   // InferenceMode should be used to guard all tensors operations
   torch::InferenceMode infer_guard(model_state_->EnabledInferenceMode());
 
@@ -1720,8 +1750,7 @@ ModelInstanceState::SetInputTensors(
         // EVERY request in this batch gets this INVALID_ARG (per-request
         // dropping mid-collection is not supported by the backend utils);
         // the batchmates' error is retryable, a bricked instance is not.
-        if (element_cnt <= 0 && !device_.is_cpu() &&
-            HasV3RequestBatchLayout()) {
+        if (element_cnt <= 0 && !device_.is_cpu() && HasRequestBatchLayout()) {
           return TRITONSERVER_ErrorNew(
               TRITONSERVER_ERROR_INVALID_ARG,
               (std::string("ragged input '") + input_name + "' request " +
@@ -1753,12 +1782,11 @@ ModelInstanceState::SetInputTensors(
   // batch is never split between paths; any mismatch falls back wholesale.
   if (prestaged_entry_ != nullptr) {
     const int64_t r = static_cast<int64_t>(total_batch_size);
-    bool viable =
-        (!device_.is_cpu()) && (r > 0) &&
-        (Kind() != TRITONSERVER_INSTANCEGROUPKIND_MODEL) &&
-        (prestaged_bucket_ >= r) &&
-        (prestaged_entry_->static_inputs.size() ==
-         static_cast<size_t>(input_count) + batch_input_count_);
+    bool viable = (!device_.is_cpu()) && (r > 0) &&
+                  (Kind() != TRITONSERVER_INSTANCEGROUPKIND_MODEL) &&
+                  (prestaged_bucket_ >= r) &&
+                  (prestaged_entry_->static_inputs.size() ==
+                   static_cast<size_t>(input_count) + batch_input_count_);
     for (uint32_t i = 0; viable && (i < input_count); ++i) {
       const DeclaredInput& info = declared[i];
       const auto idx_it = input_index_map_.find(info.name);
@@ -1774,8 +1802,7 @@ ModelInstanceState::SetInputTensors(
                (st.scalar_type() == torch_dtype.second) &&
                (st.numel() % prestaged_bucket_ == 0) &&
                (st.size(0) % prestaged_bucket_ == 0) &&
-               (info.batchn_elements ==
-                r * (st.numel() / prestaged_bucket_)) &&
+               (info.batchn_elements == r * (st.numel() / prestaged_bucket_)) &&
                (info.batchn_elements > 0) && info.ragged_uniform;
     }
     // Batch-input target buffers are skipped (content invariant per bucket)
@@ -1821,8 +1848,8 @@ ModelInstanceState::SetInputTensors(
       const int64_t r = static_cast<int64_t>(total_batch_size);
       torch::Tensor& st =
           prestaged_entry_->static_inputs[input_index_map_[info.name]];
-      const size_t batchn_byte_size = static_cast<size_t>(
-          info.batchn_elements * st.element_size());
+      const size_t batchn_byte_size =
+          static_cast<size_t>(info.batchn_elements * st.element_size());
       // This ProcessTensor overload returns void; per-request failures are
       // reported through `responses` internally.
       collector->ProcessTensor(
@@ -1942,12 +1969,6 @@ ModelInstanceState::SetInputTensors(
   *cuda_copy |= collector->Finalize();
 
   return nullptr;
-  }
-  catch (const std::exception& ex) {
-    return TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_INTERNAL,
-        (std::string("input collection failed: ") + ex.what()).c_str());
-  }
 }
 
 ModelState*
