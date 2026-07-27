@@ -1914,6 +1914,26 @@ ModelInstanceState::SetInputTensors(
       if (!info.ragged_uniform) {
         batch_ragged_nonuniform_ = true;
       }
+      // A ragged request with NO elements cannot carry a real candidate row.
+      // The canonical-layout model derives per-request row counts from this
+      // input; running it on an empty request trips a device-side assert
+      // INSIDE the model, which poisons the CUDA context and bricks the
+      // instance (the server keeps answering, every inference fails) --
+      // observed live with an empty packed_multiple probe, on the EAGER path.
+      // Reject the batch up front instead.
+      if (!device_.is_cpu() && HasV3RequestBatchLayout()) {
+        for (size_t idx = 0; idx < info.per_request_elements.size(); ++idx) {
+          if (info.per_request_elements[idx] <= 0) {
+            return TRITONSERVER_ErrorNew(
+                TRITONSERVER_ERROR_INVALID_ARG,
+                (std::string("ragged input '") + info.name + "' request " +
+                 std::to_string(idx) +
+                 " is empty; the request-batch layout requires at least one "
+                 "row per request")
+                    .c_str());
+          }
+        }
+      }
       // Partial-graph split: the ragged multi input's per-request element
       // counts are the batch's REAL candidate rows (the wire ships real rows).
       // Persist them as row counts for the boundary gather + trunk end
