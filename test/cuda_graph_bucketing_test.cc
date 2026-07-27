@@ -33,43 +33,72 @@
 
 namespace triton::backend::pytorch { namespace {
 
-TEST(ParseCsvInt64Set, ParsesSortedUnique)
+namespace {
+std::set<int64_t>
+MustParse(const std::string& csv)
+{
+  std::set<int64_t> out;
+  EXPECT_TRUE(ParseCsvInt64SetStrict(csv, &out)) << "csv: " << csv;
+  return out;
+}
+
+bool
+ParseFails(const std::string& csv)
+{
+  std::set<int64_t> out;
+  return !ParseCsvInt64SetStrict(csv, &out);
+}
+}  // namespace
+
+TEST(ParseCsvInt64SetStrict, ParsesSortedUnique)
 {
   EXPECT_EQ(
-      ParseCsvInt64Set("16,18,20,22,24"),
-      (std::set<int64_t>{16, 18, 20, 22, 24}));
+      MustParse("16,18,20,22,24"), (std::set<int64_t>{16, 18, 20, 22, 24}));
 }
 
-TEST(ParseCsvInt64Set, SortsAndDeduplicates)
+TEST(ParseCsvInt64SetStrict, SortsAndDeduplicates)
 {
-  EXPECT_EQ(ParseCsvInt64Set("24,16,16,20"), (std::set<int64_t>{16, 20, 24}));
+  EXPECT_EQ(MustParse("24,16,16,20"), (std::set<int64_t>{16, 20, 24}));
 }
 
-TEST(ParseCsvInt64Set, SingleValue)
+TEST(ParseCsvInt64SetStrict, SingleValue)
 {
-  EXPECT_EQ(ParseCsvInt64Set("16"), (std::set<int64_t>{16}));
+  EXPECT_EQ(MustParse("16"), (std::set<int64_t>{16}));
 }
 
-TEST(ParseCsvInt64Set, EmptyStringYieldsEmptySet)
+TEST(ParseCsvInt64SetStrict, EmptyStringYieldsEmptySet)
 {
-  EXPECT_TRUE(ParseCsvInt64Set("").empty());
+  // Parses (no malformed token) but yields nothing; the caller is responsible
+  // for treating a present-but-empty allowlist as an error.
+  EXPECT_TRUE(MustParse("").empty());
 }
 
-TEST(ParseCsvInt64Set, ToleratesSurroundingWhitespace)
+TEST(ParseCsvInt64SetStrict, ToleratesSurroundingWhitespace)
 {
-  // std::stoll skips leading whitespace and stops at the first non-digit.
-  EXPECT_EQ(ParseCsvInt64Set(" 16 , 20 "), (std::set<int64_t>{16, 20}));
+  EXPECT_EQ(MustParse(" 16 , 20 "), (std::set<int64_t>{16, 20}));
 }
 
-TEST(ParseCsvInt64Set, SkipsEmptyAndTrailingCommaTokens)
+TEST(ParseCsvInt64SetStrict, SkipsEmptyAndTrailingCommaTokens)
 {
-  EXPECT_EQ(ParseCsvInt64Set("16,,20,"), (std::set<int64_t>{16, 20}));
-  EXPECT_EQ(ParseCsvInt64Set(",16"), (std::set<int64_t>{16}));
+  EXPECT_EQ(MustParse("16,,20,"), (std::set<int64_t>{16, 20}));
+  EXPECT_EQ(MustParse(",16"), (std::set<int64_t>{16}));
 }
 
-TEST(ParseCsvInt64Set, SkipsNonNumericTokens)
+TEST(ParseCsvInt64SetStrict, RejectsNonNumericTokens)
 {
-  EXPECT_EQ(ParseCsvInt64Set("16,abc,20"), (std::set<int64_t>{16, 20}));
+  // A tolerant parse turned these into silently-wrong sets; the allowlist
+  // must reject them so the caller can fail loudly (an accidentally-empty
+  // allowlist inverts into unbounded capture).
+  EXPECT_TRUE(ParseFails("abc"));
+  EXPECT_TRUE(ParseFails("16,abc,20"));
+}
+
+TEST(ParseCsvInt64SetStrict, RejectsPartiallyNumericTokens)
+{
+  EXPECT_TRUE(ParseFails("16x,20"));    // trailing garbage
+  EXPECT_TRUE(ParseFails("[16,20]"));   // bracketed list
+  EXPECT_TRUE(ParseFails("16;20;24"));  // wrong separator
+  EXPECT_TRUE(ParseFails("16 20 24"));  // space-separated
 }
 
 TEST(PadWasteRows, ZeroWhenExactOrRequestExceedsBucket)

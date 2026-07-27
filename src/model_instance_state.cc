@@ -1716,7 +1716,10 @@ ModelInstanceState::SetInputTensors(
         // assert INSIDE the model, which poisons the CUDA context and bricks
         // the instance (the server keeps answering, every inference fails) --
         // observed live with an empty packed_multiple probe, on the EAGER
-        // path. Reject the batch up front instead.
+        // path. Reject the batch up front instead. Deliberate blast radius:
+        // EVERY request in this batch gets this INVALID_ARG (per-request
+        // dropping mid-collection is not supported by the backend utils);
+        // the batchmates' error is retryable, a bricked instance is not.
         if (element_cnt <= 0 && !device_.is_cpu() &&
             HasV3RequestBatchLayout()) {
           return TRITONSERVER_ErrorNew(

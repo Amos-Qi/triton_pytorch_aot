@@ -605,8 +605,20 @@ ModelState::ParseParameters()
         if (serr != nullptr) {
           TRITONSERVER_ErrorDelete(serr);
         } else {
-          cuda_graph_batch_sizes_ = ParseCsvInt64Set(val);
-          const bool had_entries = !cuda_graph_batch_sizes_.empty();
+          // The parameter's PRESENCE is the declaration of intent to bound
+          // capture (nobody sets it to opt into unbounded any-shape mode --
+          // that is what omitting it means). So: a malformed value, an empty
+          // value, or a value whose entries all filter out must FAIL the
+          // model load, never silently become the empty set, because empty
+          // inverts the meaning into unbounded capture.
+          if (!ParseCsvInt64SetStrict(val, &cuda_graph_batch_sizes_)) {
+            return TRITONSERVER_ErrorNew(
+                TRITONSERVER_ERROR_INVALID_ARG,
+                (std::string("CUDA_GRAPH_BATCH_SIZES '") + val +
+                 "' is not a comma-separated integer list for model '" +
+                 Name() + "'")
+                    .c_str());
+          }
           // Drop entries no real batch can ever match: non-positive values
           // (warmup would try to capture at them) and values above
           // max_batch_size (the scheduler never forms such batches; their
@@ -627,15 +639,11 @@ ModelState::ParseParameters()
               ++b_it;
             }
           }
-          // An explicitly-configured allowlist that filtered down to nothing
-          // must NOT silently become the empty set: empty means "capture any
-          // first-seen shape (unbounded)" -- the exact opposite of what an
-          // allowlist asks for. Fail the model load instead.
-          if (had_entries && cuda_graph_batch_sizes_.empty()) {
+          if (cuda_graph_batch_sizes_.empty()) {
             return TRITONSERVER_ErrorNew(
                 TRITONSERVER_ERROR_INVALID_ARG,
                 (std::string("CUDA_GRAPH_BATCH_SIZES '") + val +
-                 "' has no entry in [1, max_batch_size=" +
+                 "' yields no usable entry in [1, max_batch_size=" +
                  std::to_string(max_bs) +
                  "]; refusing to fall back to unbounded capture for model '" +
                  Name() + "'")
@@ -652,10 +660,10 @@ ModelState::ParseParameters()
 
     // Self-protecting override: capture/replay needs a single-runner
     // (run_single_threaded, num_runners=1) loader per instance. Weight sharing
-    // would reuse ONE such loader across all instances (LoadModel: reuse
-    // ~229-241, register ~286-294), racing their captures/replays -- so force
-    // it off. ParseParameters runs at model init (before any LoadModel), so
-    // this override is effective; LoadModel itself is unchanged.
+    // would reuse ONE such loader across all instances, racing their
+    // captures/replays -- so force it off. ParseParameters runs at model init
+    // (before any LoadModel), so this override is effective by the time
+    // LoadModel reads the flags.
     if (enable_cuda_graph_ && enable_weight_sharing_) {
       enable_weight_sharing_ = false;
       LOG_MESSAGE(

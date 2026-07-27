@@ -38,29 +38,49 @@ namespace triton::backend::pytorch {
 // logic is the shipped logic.
 
 // Parse a comma-separated int64 list (e.g. the CUDA_GRAPH_BATCH_SIZES
-// parameter) into a sorted, deduplicated set. Non-numeric or empty tokens are
-// skipped (tolerant parse) and a trailing comma is ignored. Behaviourally
-// identical to the historical inline parse in ModelState::ParseParameters.
-inline std::set<int64_t>
-ParseCsvInt64Set(const std::string& csv)
+// parameter) into a sorted, deduplicated set. STRICT: every non-empty token
+// must fully parse as an integer (surrounding whitespace allowed); returns
+// false on the first malformed token, leaving *out unspecified. Empty tokens
+// (",," / a trailing comma) are skipped. Strictness matters because this
+// feeds an allowlist whose accidental emptiness would invert its meaning
+// (see ModelState::ParseParameters): a tolerant parse turned "abc" or
+// "[16,20]" into silently-wrong sets.
+inline bool
+ParseCsvInt64SetStrict(const std::string& csv, std::set<int64_t>* out)
 {
-  std::set<int64_t> out;
+  out->clear();
   size_t start = 0;
-  while (start < csv.size()) {
+  while (start <= csv.size()) {
     size_t comma = csv.find(',', start);
-    std::string tok = csv.substr(
-        start, comma == std::string::npos ? std::string::npos : comma - start);
-    try {
-      out.insert(std::stoll(tok));
+    const size_t end = (comma == std::string::npos) ? csv.size() : comma;
+    std::string tok = csv.substr(start, end - start);
+    // Trim surrounding whitespace.
+    const size_t first = tok.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+      tok.clear();
+    } else {
+      const size_t last = tok.find_last_not_of(" \t");
+      tok = tok.substr(first, last - first + 1);
     }
-    catch (...) {
+    if (!tok.empty()) {
+      try {
+        size_t consumed = 0;
+        const int64_t v = std::stoll(tok, &consumed);
+        if (consumed != tok.size()) {
+          return false;  // trailing garbage ("16x", "[16", "16;20")
+        }
+        out->insert(v);
+      }
+      catch (...) {
+        return false;  // not a number at all
+      }
     }
     if (comma == std::string::npos) {
       break;
     }
     start = comma + 1;
   }
-  return out;
+  return true;
 }
 
 // Number of padded (dummy) request rows added when a batch of size `r` replays
