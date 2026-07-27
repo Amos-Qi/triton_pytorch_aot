@@ -94,9 +94,9 @@ ModelInstanceState::ModelInstanceState(
 
   if (model_state->PartialSplit()) {
     // Partial-graph split: aoti_model_ (model.pt2) is the graph-captured
-    // FRONT; the eager row-dynamic TRUNK loads from model_trunk.pt2.
-    // ParseParameters forced weight sharing off (the shared-loader cache is
-    // keyed by device only and would collide the two loaders).
+    // FRONT; the eager row-dynamic TRUNK loads from model_trunk.pt2. Weight
+    // sharing is compatible: the shared-loader cache is keyed by artifact
+    // name too, so the two loaders never collide.
     THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
         "model_trunk.pt2", device_, &trunk_model_path_, Kind(),
         &trunk_aoti_model_));
@@ -280,9 +280,21 @@ ModelInstanceState::Create(
 #ifdef TRITON_ENABLE_GPU
   // Capture the configured CUDA-graph buckets before the instance goes READY
   // (no-op unless ENABLE_CUDA_GRAPH + warmup widths + a bucket set are all
-  // configured). WarmupCudaGraphs never throws -- lazy capture is the safety
-  // net.
-  (*state)->WarmupCudaGraphs();
+  // configured). WarmupCudaGraphs contains per-bucket failures itself; the
+  // catch here is a belt for anything else (this function is called from an
+  // extern "C" entry point, where an escaping exception kills the process).
+  // Lazy capture is the safety net either way.
+  try {
+    (*state)->WarmupCudaGraphs();
+  }
+  catch (const std::exception& ex) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_WARN,
+        (std::string("CUDA-graph warmup threw outside the per-bucket "
+                     "containment (") +
+         ex.what() + "); continuing without warmup captures")
+            .c_str());
+  }
 #endif
 
   return nullptr;  // success
@@ -1659,6 +1671,10 @@ ModelInstanceState::ReadOutputTensors(
 {
   NVTX_RANGE(nvtx_, "ReadOutputTensors " + Name());
 
+  // Same containment rationale as SetInputTensors: this runs outside
+  // Execute's try/catch and must not let torch/responder exceptions escape
+  // to the extern "C" boundary.
+  try {
   bool use_pinned_input = model_state_->EnablePinnedInput();
   BackendOutputResponder responder(
       requests, request_count, responses, model_state_->TritonMemoryManager(),
@@ -1771,6 +1787,12 @@ ModelInstanceState::ReadOutputTensors(
 #endif
 
   return nullptr;
+  }
+  catch (const std::exception& ex) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("output processing failed: ") + ex.what()).c_str());
+  }
 }
 
 TRITONSERVER_Error*
@@ -1814,6 +1836,12 @@ ModelInstanceState::SetInputTensors(
     BackendInputCollector* collector, std::vector<const char*>* input_names,
     std::vector<torch::Tensor>* input_tensors, bool* cuda_copy)
 {
+  // Torch ops in here throw C++ exceptions (allocation failures foremost).
+  // This function runs OUTSIDE Execute's try/catch, and an exception escaping
+  // ProcessRequests crosses the extern "C" boundary -> std::terminate -> pod
+  // crash (the 2026-07-16 shadow crashloop was this class, via the prestage
+  // block). Contain everything as a request error instead.
+  try {
   // InferenceMode should be used to guard all tensors operations
   torch::InferenceMode infer_guard(model_state_->EnabledInferenceMode());
 
@@ -2209,6 +2237,12 @@ ModelInstanceState::SetInputTensors(
   *cuda_copy |= collector->Finalize();
 
   return nullptr;
+  }
+  catch (const std::exception& ex) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INTERNAL,
+        (std::string("input collection failed: ") + ex.what()).c_str());
+  }
 }
 
 #ifdef TRITON_ENABLE_GPU

@@ -144,6 +144,9 @@ ModelState::GetOrCreateBucketMetric(
   if (family == nullptr) {
     return nullptr;
   }
+  // Instances execute (and record metrics) concurrently; the map must not be
+  // read while another thread inserts.
+  std::lock_guard<std::mutex> lk(cuda_graph_metrics_mutex_);
   const auto cache_key = std::make_pair(family, bucket);
   auto it = cuda_graph_bucket_metrics_.find(cache_key);
   if (it != cuda_graph_bucket_metrics_.end()) {

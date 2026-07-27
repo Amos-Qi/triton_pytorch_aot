@@ -101,8 +101,11 @@ class ModelState : public triton::backend::BackendModel {
   // The eager-fallback counter is unlabeled -> a single metric handle.
   TRITONSERVER_Metric* metric_eager_fallbacks_ = nullptr;
   // Get-or-create cache of per-(labeled family, bucket) metric handles.
+  // Guarded by cuda_graph_metrics_mutex_: instances execute concurrently and
+  // all record metrics through this map.
   std::map<std::pair<TRITONSERVER_MetricFamily*, int64_t>, TRITONSERVER_Metric*>
       cuda_graph_bucket_metrics_;
+  std::mutex cuda_graph_metrics_mutex_;
   // Emit the "metrics unavailable" warning at most once.
   bool cuda_graph_metrics_warned_ = false;
 

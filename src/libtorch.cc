@@ -212,10 +212,28 @@ TRITONBACKEND_ModelInstanceExecute(
   // this function. If something does go wrong in processing a
   // particular request then we send an error response just for the
   // specific request.
-  instance_state->ProcessRequests(requests, request_count);
+  //
+  // Last-resort containment: an exception escaping here crosses the
+  // extern "C" boundary and terminates the whole server process. The
+  // throw-capable regions inside ProcessRequests are individually contained
+  // (SetInputTensors / Execute / ReadOutputTensors convert exceptions into
+  // request errors), so this catch should never fire; if it does, we log and
+  // deliberately do NOT touch 'requests' (we cannot know which were already
+  // responded/released -- a leaked request beats a dead pod).
+  try {
+    instance_state->ProcessRequests(requests, request_count);
 
-  if (model_state->EnabledCacheCleaning()) {
-    instance_state->ClearCache();
+    if (model_state->EnabledCacheCleaning()) {
+      instance_state->ClearCache();
+    }
+  }
+  catch (const std::exception& ex) {
+    LOG_MESSAGE(
+        TRITONSERVER_LOG_ERROR,
+        (std::string("ProcessRequests escaped exception (contained at the "
+                     "backend boundary): ") +
+         ex.what())
+            .c_str());
   }
 
   return nullptr;  // success
