@@ -76,7 +76,9 @@ class ModelState : public triton::backend::BackendModel {
   // R (request-batch) buckets to capture whole-forward CUDA graphs for
   // (CUDA_GRAPH_BATCH_SIZES). A batch is padded UP to the nearest bucket >= its
   // R, replayed, and sliced; R above the max bucket (or an empty set) falls
-  // back to eager. Empty = capture any first-seen shape (unbounded).
+  // back to eager. Empty = capture at any first-seen request count (one
+  // graph per distinct R, at whatever widths that R first arrived with;
+  // unbounded set).
   std::set<int64_t> cuda_graph_batch_sizes_;
 
   // Load-time CUDA-graph warmup input widths (0 => warmup disabled).

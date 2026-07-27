@@ -339,8 +339,11 @@ run.
   Semantics that matter:
 
   * **Omitting the parameter enables unbounded capture**: the backend captures
-    one graph per first-seen input shape, with no cap on how many. Only use
-    this when the shape universe is known to be tiny.
+    one graph per first-seen REQUEST COUNT (the cache is keyed by `R` only),
+    at whatever input widths that `R` first arrived with — if widths later
+    change for the same `R`, no new graph is captured; the one-time warmup
+    width self-heal is the only protection. Only use this when both the
+    request-count universe and the input widths are known to be fixed.
   * **A present but malformed or empty value fails model load** (the
     parameter's presence declares the intent to bound capture; silently
     falling back to unbounded would invert the meaning). Every non-empty
@@ -362,9 +365,10 @@ run.
 
   Feature widths used to build synthetic zero-valued inputs so every
   configured bucket is captured at model load, BEFORE the instance goes READY
-  (roughly 15-50 ms per bucket per instance). `SINGLE_WIDTH` is the
-  per-request column count of the dense (single) input; `MULTI_WIDTH` is the
-  per-request element count of the flattened ragged (multi) input.
+  (budget ~150 ms per bucket per instance; small models on partitioned GPUs
+  have measured well under that). `SINGLE_WIDTH` is the per-request column
+  count of the dense (single) input; `MULTI_WIDTH` is the per-request element
+  count of the flattened ragged (multi) input.
 
   Both must be set (and a non-empty `CUDA_GRAPH_BATCH_SIZES` configured) or
   warmup is skipped and each bucket captures lazily on its first live request
@@ -396,12 +400,13 @@ count, which is only meaningful for models declaring exactly this layout:
 | 2 | `request_end_position` | `(R,)` accumulated element counts (batch input) |
 
 Models that do not match this convention still get exact-size graph replay,
-but never padding or load-time warmup. For such models an empty ragged
-request is also rejected with `INVALID_ARG` before reaching the model: an
+but never padding or load-time warmup. For models that DO match it, an empty
+ragged request is rejected with `INVALID_ARG` before reaching the model: an
 empty request otherwise trips a device-side assert inside the model that
 poisons the CUDA context (the server keeps answering readiness while every
 inference fails). The whole batch receives the error — a retryable failure,
-unlike a bricked instance.
+unlike a bricked instance. Models outside the convention do not get this
+guard (the backend cannot know an empty ragged input is invalid for them).
 
 #### Metrics
 
@@ -432,7 +437,9 @@ zero capture failures after load.
 * A failed capture intentionally leaks the partial `at::cuda::CUDAGraph`
   object: its destructor can throw after a failed capture, which would
   terminate the process. The failure is negative-cached (the bucket pins to
-  eager), so the leak is bounded to one object per failed bucket.
+  eager), so the leak is bounded to one object per failed ATTEMPT — at most
+  two per bucket at load (the warmup's retry pass clears the negative cache
+  once and re-attempts).
 
 ### Model Instance Group Kind
 

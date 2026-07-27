@@ -716,7 +716,8 @@ ModelInstanceState::ExecuteWithCudaGraph(
   // from lower_bound(r), skipping buckets whose capture failed;
   // capture-on-first-use and, if that capture fails, advance to the next
   // healthy bucket. Bounded by the bucket-set size (no retry storm). Empty
-  // allowlist keeps the "capture the exact first-seen shape" behavior.
+  // allowlist keeps the "capture at the first-seen request count" behavior
+  // (keyed by R only; widths are whatever that R first arrived with).
   std::vector<torch::Tensor> padded_storage;
   const std::vector<torch::Tensor>* inputs_at_bucket = nullptr;
   int64_t bucket = -1;
