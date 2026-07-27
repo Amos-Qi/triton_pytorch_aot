@@ -97,10 +97,25 @@ class ModelState : public triton::backend::BackendModel {
   // The eager-fallback counter is unlabeled -> a single metric handle.
   TRITONSERVER_Metric* metric_eager_fallbacks_ = nullptr;
   // Get-or-create cache of per-(labeled family, bucket) metric handles.
+  // Guarded by cuda_graph_metrics_mutex_: instances execute concurrently and
+  // all record metrics through this map.
   std::map<std::pair<TRITONSERVER_MetricFamily*, int64_t>, TRITONSERVER_Metric*>
       cuda_graph_bucket_metrics_;
+  std::mutex cuda_graph_metrics_mutex_;
   // Emit the "metrics unavailable" warning at most once.
   bool cuda_graph_metrics_warned_ = false;
+
+  // Serializes CUDA-graph captures across instances: concurrent captures gain
+  // nothing (each instance has its own graphs) and their transient warmup
+  // allocations + pre-capture cache flushes would race the VRAM margin the
+  // captures need on a fully-packed device.
+  std::mutex cuda_graph_capture_mutex_;
+
+  // Guards the weight-sharing loader cache (find + load + emplace as one
+  // critical section). Triton loads instances of one model sequentially today
+  // (this backend does not declare parallel instance loading), so the lock is
+  // uncontended insurance against that assumption changing.
+  std::mutex loader_cache_mutex_;
 
   // Flag to disable pinned input memory. Defaults to false (pinned input
   // enabled by default).
@@ -149,6 +164,9 @@ class ModelState : public triton::backend::BackendModel {
   {
     return cuda_graph_batch_sizes_;
   }
+
+  // One capture at a time model-wide (see the member comment).
+  std::mutex& CudaGraphCaptureMutex() { return cuda_graph_capture_mutex_; }
 
   // Load-time warmup input widths (0 => warmup disabled). See the members for
   // units.

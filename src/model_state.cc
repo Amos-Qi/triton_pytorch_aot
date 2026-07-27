@@ -143,6 +143,9 @@ ModelState::GetOrCreateBucketMetric(
   if (family == nullptr) {
     return nullptr;
   }
+  // Instances execute (and record metrics) concurrently; the map must not be
+  // read while another thread inserts.
+  std::lock_guard<std::mutex> lk(cuda_graph_metrics_mutex_);
   const auto cache_key = std::make_pair(family, bucket);
   auto it = cuda_graph_bucket_metrics_.find(cache_key);
   if (it != cuda_graph_bucket_metrics_.end()) {
@@ -399,7 +402,12 @@ ModelState::LoadModel(
   }
 
   // If weight sharing is enabled, skip loading model if
-  // it is already available on the target device
+  // it is already available on the target device.
+  // The find below and the emplace at the end of this function form one
+  // critical section: without the lock, two concurrently-initializing
+  // instances could both miss the cache and load duplicate copies (or race
+  // the map itself). Serial instance loading makes this uncontended today.
+  std::lock_guard<std::mutex> cache_lk(loader_cache_mutex_);
   std::pair<bool, int> device_pair;
   if (enable_weight_sharing_) {
     device_pair = std::make_pair(!device.is_cpu(), device.index());
@@ -434,9 +442,19 @@ ModelState::LoadModel(
     // runner, no worker-thread stream join) -- otherwise capture fails with
     // "operation not permitted when stream is capturing"
     // (pytorch/pytorch@85467ed). This overrides weight sharing's multi-runner
-    // setting for the graph path.
-    const bool run_single_threaded = enable_cuda_graph_;
-    if (enable_cuda_graph_) {
+    // setting for the graph path. CUDA graphs cannot exist on a CPU instance,
+    // so don't degrade its loader (the runtime gate keeps CPU eager anyway).
+    const bool cuda_graph_applies = enable_cuda_graph_ && !device.is_cpu();
+    if (enable_cuda_graph_ && device.is_cpu()) {
+      LOG_MESSAGE(
+          TRITONSERVER_LOG_WARN,
+          (std::string("ENABLE_CUDA_GRAPH is set but instance '") + Name() +
+           "' runs on CPU; CUDA graphs are disabled for it (eager run, "
+           "default threading)")
+              .c_str());
+    }
+    const bool run_single_threaded = cuda_graph_applies;
+    if (cuda_graph_applies) {
       num_runners = 1;
     }
 
@@ -588,6 +606,41 @@ ModelState::ParseParameters()
           TRITONSERVER_ErrorDelete(serr);
         } else {
           cuda_graph_batch_sizes_ = ParseCsvInt64Set(val);
+          const bool had_entries = !cuda_graph_batch_sizes_.empty();
+          // Drop entries no real batch can ever match: non-positive values
+          // (warmup would try to capture at them) and values above
+          // max_batch_size (the scheduler never forms such batches; their
+          // graphs would only waste capture time + VRAM).
+          const int64_t max_bs = static_cast<int64_t>(MaxBatchSize());
+          for (auto b_it = cuda_graph_batch_sizes_.begin();
+               b_it != cuda_graph_batch_sizes_.end();) {
+            if (*b_it <= 0 || (max_bs > 0 && *b_it > max_bs)) {
+              LOG_MESSAGE(
+                  TRITONSERVER_LOG_WARN,
+                  (std::string("Ignoring CUDA_GRAPH_BATCH_SIZES entry ") +
+                   std::to_string(*b_it) + " for model '" + Name() +
+                   "' (must be in [1, max_batch_size=" +
+                   std::to_string(max_bs) + "])")
+                      .c_str());
+              b_it = cuda_graph_batch_sizes_.erase(b_it);
+            } else {
+              ++b_it;
+            }
+          }
+          // An explicitly-configured allowlist that filtered down to nothing
+          // must NOT silently become the empty set: empty means "capture any
+          // first-seen shape (unbounded)" -- the exact opposite of what an
+          // allowlist asks for. Fail the model load instead.
+          if (had_entries && cuda_graph_batch_sizes_.empty()) {
+            return TRITONSERVER_ErrorNew(
+                TRITONSERVER_ERROR_INVALID_ARG,
+                (std::string("CUDA_GRAPH_BATCH_SIZES '") + val +
+                 "' has no entry in [1, max_batch_size=" +
+                 std::to_string(max_bs) +
+                 "]; refusing to fall back to unbounded capture for model '" +
+                 Name() + "'")
+                    .c_str());
+          }
           LOG_MESSAGE(
               TRITONSERVER_LOG_INFO,
               (std::string("CUDA graph R buckets: '") + val +

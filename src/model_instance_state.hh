@@ -122,6 +122,13 @@ class ModelInstanceState : public BackendModelInstance {
   };
   std::unordered_map<std::string, CudaGraphEntry> cuda_graph_cache_;
 
+  // One shared capture memory pool per INSTANCE: within an instance only one
+  // graph replays at a time (batches are serialized), so every bucket's
+  // intermediates can live in the same pool -- memory ~= the largest bucket
+  // instead of the sum over buckets. First capture creates the pool; the
+  // followers pass its id to capture_begin. {0,0} = not created yet.
+  at::cuda::MempoolId_t cuda_graph_mempool_{0, 0};
+
   // Negative cache: input-shape keys whose capture failed once. We go straight
   // to eager for these (no re-warmup + re-capture + graph leak on every
   // subsequent request of the same shape).
@@ -133,6 +140,10 @@ class ModelInstanceState : public BackendModelInstance {
   // re-populates at the real shape (the cache is keyed only by "R=<bucket>",
   // not by width).
   bool warmup_widths_checked_ = false;
+
+  // Tri-state cache for HasV3RequestBatchLayout(): 0 = not checked yet,
+  // 1 = the model exposes the canonical request-batch layout, -1 = it doesn't.
+  int v3_layout_state_ = 0;
 
   // Input prestaging (per-batch state; Triton runs batches serially per
   // instance). When SetInputTensors finds an already-captured bucket whose
@@ -188,6 +199,15 @@ class ModelInstanceState : public BackendModelInstance {
   cudaStream_t GetCudaStreamByInstanceKind();
 
 #ifdef TRITON_ENABLE_GPU
+  // Whether the model exposes the canonical request-batch layout:
+  // packed_single_batch_tensor / packed_multiple_batch_tensor /
+  // request_end_position at input indices 0/1/2. PadRequestsUp (and the
+  // warmup's synthetic zero inputs) rewrite input[2] as a per-request cumsum,
+  // which is only meaningful for this layout -- any other model replays
+  // exact-R shapes only and never pads. Cached after the first call
+  // (input_index_map_ is final after ValidateInputs).
+  bool HasV3RequestBatchLayout();
+
   // Build a stable key from the input tensor shapes for the CUDA-graph cache.
   std::string InputShapeKey(const std::vector<torch::Tensor>& inputs) const;
 
